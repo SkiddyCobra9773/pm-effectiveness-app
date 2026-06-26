@@ -370,39 +370,98 @@ def pillar5_backlog(df, ref_date):
     }
 
 
-def pillar6_cost(pm, bkd, fuc, df):
-    """Cost Visibility"""
-    all_hrs   = df['Actual Hours'].sum()
-    pm_hrs    = pm['Actual Hours'].sum()
-    bkd_hrs   = bkd['Actual Hours'].sum()
-    fuc_hrs   = fuc['Actual Hours'].sum()
-    unknown_hrs = all_hrs - pm_hrs - bkd_hrs - fuc_hrs
-
-    bkd_zero  = (bkd['Actual Hours'] == 0).sum()
+def pillar6_cost(pm, bkd, fuc, df, cost_df=None):
+    """Cost Visibility — enhanced with cost export when available"""
+    # ── labor hour analysis (always) ──
+    bkd_zero     = (bkd['Actual Hours'] == 0).sum()
     bkd_zero_pct = 100*bkd_zero/len(bkd) if len(bkd) else 0
-    fuc_zero  = (fuc['Actual Hours'] == 0).sum()
+    fuc_zero     = (fuc['Actual Hours'] == 0).sum()
     fuc_zero_pct = 100*fuc_zero/len(fuc) if len(fuc) else 0
-
-    # Estimated hidden hours: avg BKD hours (from those that have hours) * zero count
+    pm_zero      = (pm['Actual Hours'] == 0).sum()
     bkd_with_hrs = bkd[bkd['Actual Hours'] > 0]
     avg_bkd_hr   = bkd_with_hrs['Actual Hours'].mean() if len(bkd_with_hrs) else 0
-    est_hidden   = avg_bkd_hr * bkd_zero
 
-    # PM vs Corrective labor split
-    corr_hrs  = bkd_hrs + fuc_hrs
-    planned_pct = 100*pm_hrs/all_hrs if all_hrs else 0
-    corr_pct    = 100*corr_hrs/all_hrs if all_hrs else 0
+    has_cost = cost_df is not None and len(cost_df) > 0
 
-    rag = "RED" if bkd_zero_pct > 50 else ("AMBER" if bkd_zero_pct > 20 else "GREEN")
+    if has_cost:
+        # Join cost to main df on WO number
+        cost_df = cost_df.copy()
+        cost_df['WO_Number'] = cost_df['Work Order Number'].astype(str).str.strip()
+        df2 = df.copy()
+        df2['WO_Number'] = df2['WorkOrderNumber'].astype(str).str.strip()
+        merged = df2.merge(
+            cost_df[['WO_Number','Cost per Work Order','Actual Cost Classification']],
+            on='WO_Number', how='left'
+        )
+        pm_m  = merged[merged['OrderType']=='GM09']
+        bkd_m = merged[merged['OrderType']=='GM02']
+        fuc_m = merged[merged['OrderType'].isin(['GM01','PM01'])]
+
+        total_cost   = merged['Cost per Work Order'].sum()
+        pm_cost      = pm_m['Cost per Work Order'].sum()
+        bkd_cost     = bkd_m['Cost per Work Order'].sum()
+        fuc_cost     = fuc_m['Cost per Work Order'].sum()
+        avg_pm_cost  = pm_m['Cost per Work Order'].mean()
+        avg_bkd_cost = bkd_m['Cost per Work Order'].mean()
+        cost_ratio   = avg_bkd_cost / avg_pm_cost if avg_pm_cost else 0
+
+        # Cost classification counts
+        vc = cost_df['Actual Cost Classification'].str.strip().value_counts()
+        exceeds  = vc.get('Actual Cost Exceeds Planned Cost', 0)
+        within   = vc.get('Within Boundaries', 0)
+        below    = vc.get('Actual Cost is Lower than Planned Cost', 0)
+        exceed_pct = 100*exceeds/len(cost_df) if len(cost_df) else 0
+
+        # Monthly cost trend (H1 2026)
+        month_keys = ['2026-01','2026-02','2026-03','2026-04','2026-05','2026-06']
+        months_str = ['Jan','Feb','Mar','Apr','May','Jun']
+        merged['Month'] = pd.to_datetime(merged['Created On'], errors='coerce').dt.to_period('M').astype(str)
+        cost_mo = []
+        for mk in month_keys:
+            cost_mo.append(merged[merged['Month']==mk]['Cost per Work Order'].sum())
+
+        # Top 10 WOs by cost
+        top_wos = cost_df.nlargest(10,'Cost per Work Order')[
+            ['Work Order Number','Description','Cost per Work Order','Actual Cost Classification']
+        ].copy()
+
+        # WOs with cost > 0 but no hours (critical flag)
+        merged['has_cost']  = merged['Cost per Work Order'] > 0
+        merged['zero_hrs']  = merged['Actual Hours'] == 0
+        cost_no_hrs = merged[(merged['has_cost']) & (merged['zero_hrs'])]
+        cost_no_hrs_bkd = cost_no_hrs[cost_no_hrs['OrderType']=='GM02']
+
+        rag_cost = "GREEN" if exceed_pct < 15 else ("AMBER" if exceed_pct < 30 else "RED")
+        # If breakdowns have cost but no hours — escalate to at least AMBER
+        if len(cost_no_hrs_bkd) > 5 and rag_cost == "GREEN": rag_cost = "AMBER"
+
+        rag = rag_cost
+        key_metric = (f"Total ${total_cost:,.0f}  |  BKD avg ${avg_bkd_cost:,.0f} "
+                      f"vs PM avg ${avg_pm_cost:,.0f}  |  {exceed_pct:.0f}% over plan")
+    else:
+        # No cost file — fall back to labor-only analysis
+        total_cost = pm_cost = bkd_cost = fuc_cost = 0
+        avg_pm_cost = avg_bkd_cost = cost_ratio = 0
+        exceeds = within = below = exceed_pct = 0
+        cost_mo = [0]*6; months_str = ['Jan','Feb','Mar','Apr','May','Jun']
+        top_wos = pd.DataFrame(); merged = df.copy()
+        cost_no_hrs_bkd = pd.DataFrame()
+        rag = "RED" if bkd_zero_pct > 50 else ("AMBER" if bkd_zero_pct > 20 else "GREEN")
+        key_metric = f"No cost file — BKD hrs captured: {100-bkd_zero_pct:.0f}%"
 
     return {
-        'all_hrs': all_hrs, 'pm_hrs': pm_hrs, 'bkd_hrs': bkd_hrs, 'fuc_hrs': fuc_hrs,
+        'has_cost': has_cost,
         'bkd_zero': bkd_zero, 'bkd_zero_pct': bkd_zero_pct,
         'fuc_zero': fuc_zero, 'fuc_zero_pct': fuc_zero_pct,
-        'avg_bkd_hr': avg_bkd_hr, 'est_hidden': est_hidden,
-        'planned_pct': planned_pct, 'corr_pct': corr_pct,
-        'rag': rag,
-        'key_metric': f"BKD hrs captured: {100-bkd_zero_pct:.0f}%  |  ~{est_hidden:.0f} hrs hidden",
+        'pm_zero': pm_zero, 'avg_bkd_hr': avg_bkd_hr,
+        'total_cost': total_cost, 'pm_cost': pm_cost,
+        'bkd_cost': bkd_cost, 'fuc_cost': fuc_cost,
+        'avg_pm_cost': avg_pm_cost, 'avg_bkd_cost': avg_bkd_cost,
+        'cost_ratio': cost_ratio,
+        'exceeds': exceeds, 'within': within, 'below': below, 'exceed_pct': exceed_pct,
+        'cost_mo': cost_mo, 'months_str': months_str,
+        'top_wos': top_wos, 'cost_no_hrs_bkd': cost_no_hrs_bkd,
+        'rag': rag, 'key_metric': key_metric,
     }
 
 
@@ -456,7 +515,7 @@ def pillar7_reliability(bkd, df, ref_date):
 # ═════════════════════════════════════════════════════════════════════════════
 # WORKBOOK BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
-def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
+def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=None):
     p1, p2, p3, p4, p5, p6, p7 = analyses
     date_range = (f"{df['Created On'].min().strftime('%b %Y')}–"
                   f"{df['Created On'].max().strftime('%b %Y')}")
@@ -485,7 +544,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
         (PILLARS[4], p5['rag'], p5['key_metric'],
          f"Review {p5['age_91p']} WOs aged 90+ days; assess if still valid" if p5['rag'] != "GREEN" else "Backlog age is healthy"),
         (PILLARS[5], p6['rag'], p6['key_metric'],
-         f"~{p6['est_hidden']:.0f} labor hours unaccounted on BKDs — cost of failure understated" if p6['rag'] != "GREEN" else "Labor cost capture is complete"),
+         (f"BKD avg cost ${p6['avg_bkd_cost']:,.0f} vs PM avg ${p6['avg_pm_cost']:,.0f}. {p6['bkd_zero']} BKD WOs still missing labor hours."
+          if p6['has_cost'] else
+          f"{p6['bkd_zero']} BKD WOs have zero labor hours — failure cost unknown. Upload cost export for spend analysis.")),
         (PILLARS[6], p7['rag'], p7['key_metric'],
          f"MTBF {p7['mtbf_overall']}d — investigate top failure clusters to extend run intervals" if p7['rag'] != "GREEN" else f"MTBF is healthy at {p7['mtbf_overall']} days"),
     ]
@@ -848,77 +909,162 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
     # ── SHEET 6: Pillar 6 — Cost Visibility ──────────────────────────────────
     ws6 = wb.create_sheet("6 · Cost Visibility"); ws6.sheet_view.showGridLines = False
     title_row(ws6,f"PILLAR 6: COST VISIBILITY  ·  {asset_label}",1,"L")
-    sub_row(ws6,"Labor hour capture by WO type. Estimated hidden cost from unbooked breakdown hours. PM vs corrective labor split.",2,"L")
+    cost_sub = ("Actual cost by WO type. Cost variance vs. plan. ⚠ Labor hours flagged separately — required for MTTR and productivity analysis."
+                if p6['has_cost'] else
+                "No cost export provided. Upload cost file to enable cost analysis. Labor hour capture shown below.")
+    sub_row(ws6, cost_sub, 2, "L")
     ws6.row_dimensions[3].height=10
 
-    for col,lbl,val,bg in [
-        ("B","Total Captured Hours",f"{p6['all_hrs']:.1f}",LIGHT_ROW),
-        ("F","BKD Hours Captured",f"{100-p6['bkd_zero_pct']:.0f}%",rag_bg("GREEN" if p6['bkd_zero_pct']<20 else "AMBER" if p6['bkd_zero_pct']<60 else "RED")),
-        ("J","Est. Hidden BKD Hours",f"~{p6['est_hidden']:.0f}",rag_bg("RED" if p6['est_hidden']>20 else "AMBER")),
-    ]:
+    if p6['has_cost']:
+        kpi3 = [
+            ("B", "Total Spend",       f"${p6['total_cost']:,.0f}",   LIGHT_ROW),
+            ("F", "BKD vs PM Avg Cost",f"${p6['avg_bkd_cost']:,.0f} vs ${p6['avg_pm_cost']:,.0f}",
+             rag_bg("AMBER")),
+            ("J", "WOs Over Plan",     f"{p6['exceeds']} ({p6['exceed_pct']:.0f}%)",
+             rag_bg("GREEN" if p6['exceed_pct']<15 else "AMBER" if p6['exceed_pct']<30 else "RED")),
+        ]
+    else:
+        kpi3 = [
+            ("B", "Cost File",         "Not uploaded",     YELLOW),
+            ("F", "BKD Zero-Hour %",   f"{p6['bkd_zero_pct']:.0f}%",
+             rag_bg("RED" if p6['bkd_zero_pct']>50 else "AMBER")),
+            ("J", "PM Zero-Hour %",    f"{p6['pm_zero']} WOs",
+             rag_bg("GREEN" if p6['pm_zero']==0 else "AMBER")),
+        ]
+    for col,lbl,val,bg in kpi3:
         ec = chr(ord(col)+2)
         ws6.merge_cells(f"{col}4:{ec}4"); ws6[f"{col}4"].value=lbl
         ws6[f"{col}4"].font=Font(name="Arial",bold=True,size=8,color="5A5A5A")
         ws6[f"{col}4"].fill=wfill(WHITE); ws6[f"{col}4"].alignment=cal("left")
         ws6.merge_cells(f"{col}5:{ec}5"); ws6[f"{col}5"].value=val
-        ws6[f"{col}5"].font=Font(name="Arial",bold=True,size=16,color="1F2D3D")
+        ws6[f"{col}5"].font=Font(name="Arial",bold=True,size=14,color="1F2D3D")
         ws6[f"{col}5"].fill=wfill(bg); ws6[f"{col}5"].alignment=cal(); ws6[f"{col}5"].border=bdr()
     ws6.row_dimensions[4].height=16; ws6.row_dimensions[5].height=30; ws6.row_dimensions[6].height=10
 
-    sec(ws6,"LABOR HOUR CAPTURE BY WO TYPE",7,"L")
-    for col,txt,ec in [("B","WO Type","D"),("E","WO Count","F"),("G","Actual Hours","H"),
-                        ("I","Zero-Hr WOs","J"),("K","Capture Rate","L")]:
-        hdr(ws6,col,8,txt,ec)
-    ws6.row_dimensions[8].height=18
-    cost_rows = [
-        ("PM (GM09)",             len(pm),  p6['pm_hrs'],  p4['pm_zero'],  100-p4['pm_zero_pct'],  GREEN_FLG),
-        ("Breakdown (GM02)",      len(bkd), p6['bkd_hrs'], p4['bkd_zero'], 100-p4['bkd_zero_pct'], YELLOW if p4['bkd_zero_pct']>50 else ORANGE),
-        ("Follow-up (GM01/PM01)", len(fuc), p6['fuc_hrs'], p4['fuc_zero'], 100-p4['fuc_zero_pct'], LIGHT_ROW),
-    ]
-    for i,(wt,cnt,hrs,zh,cap,bg) in enumerate(cost_rows):
-        r = i+9
+    if p6['has_cost']:
+        # ── Cost by WO type
+        sec(ws6,"COST BY WORK ORDER TYPE",7,"L")
+        for col,txt,ec in [("B","WO Type","D"),("E","Count","F"),("G","Total Cost","H"),
+                            ("I","Avg Cost / WO","J"),("K","% of Spend","L")]:
+            hdr(ws6,col,8,txt,ec)
+        ws6.row_dimensions[8].height=18
+        type_rows = [
+            ("PM (GM09)",             len(pm),  p6['pm_cost'],  p6['avg_pm_cost'],  GREEN_FLG),
+            ("Breakdown (GM02)",      len(bkd), p6['bkd_cost'], p6['avg_bkd_cost'], RED_FLG),
+            ("Follow-up (GM01/PM01)", len(fuc), p6['fuc_cost'], p6['fuc_cost']/len(fuc) if len(fuc) else 0, ORANGE),
+        ]
+        for i,(wt,cnt,tc,ac,bg) in enumerate(type_rows):
+            r = i+9
+            for mc in [f"B{r}:D{r}",f"E{r}:F{r}",f"G{r}:H{r}",f"I{r}:J{r}",f"K{r}:L{r}"]:
+                ws6.merge_cells(mc)
+            dc(ws6,"B",r,wt,bg,bold=True,align="left"); dc(ws6,"E",r,cnt,bg)
+            dc(ws6,"G",r,f"${tc:,.0f}",bg,bold=True)
+            dc(ws6,"I",r,f"${ac:,.0f}",bg)
+            dc(ws6,"K",r,f"{100*tc/p6['total_cost']:.0f}%" if p6['total_cost'] else "—",bg)
+            ws6.row_dimensions[r].height=22
+        # Total row
+        r=12
         for mc in [f"B{r}:D{r}",f"E{r}:F{r}",f"G{r}:H{r}",f"I{r}:J{r}",f"K{r}:L{r}"]:
             ws6.merge_cells(mc)
-        dc(ws6,"B",r,wt,bg,bold=True,align="left"); dc(ws6,"E",r,cnt,bg)
-        dc(ws6,"G",r,f"{hrs:.1f}",bg); dc(ws6,"I",r,zh,bg)
-        dc(ws6,"K",r,f"{cap:.0f}%",bg,bold=True); ws6.row_dimensions[r].height=22
+        dc(ws6,"B",r,"Total",MID_BG,bold=True,align="left",color=WHITE)
+        dc(ws6,"E",r,len(pm)+len(bkd)+len(fuc),MID_BG,color=WHITE)
+        dc(ws6,"G",r,f"${p6['total_cost']:,.0f}",MID_BG,bold=True,color=WHITE)
+        dc(ws6,"I",r,f"${p6['total_cost']/(len(pm)+len(bkd)+len(fuc)):,.0f}" if (len(pm)+len(bkd)+len(fuc)) else "—",MID_BG,color=WHITE)
+        dc(ws6,"K",r,"100%",MID_BG,bold=True,color=WHITE); ws6.row_dimensions[r].height=22
 
-    ws6.row_dimensions[13].height=10
-    sec(ws6,"COST VISIBILITY GAP ANALYSIS",14,"L",HDR_BG)
-    gap_rows = [
-        ("BKD WOs with zero hours",          f"{p4['bkd_zero']} of {len(bkd)}",   RED_FLG),
-        ("Avg hours per captured BKD WO",    f"{p6['avg_bkd_hr']:.2f} hrs",        LIGHT_ROW),
-        ("Estimated hidden breakdown hours", f"~{p6['est_hidden']:.0f} hrs",       YELLOW),
-        ("⚠ Failure cost cannot be assessed until BKD WOs carry actual hours",
-         "Corrective action required", RED_FLG),
-    ]
-    for col,txt,ec in [("B","Item","H"),("I","Value","L")]:
-        hdr(ws6,col,15,txt,ec)
-    ws6.row_dimensions[15].height=18
-    for i,(lbl,val,bg) in enumerate(gap_rows):
-        r = 16+i
-        ws6.merge_cells(f"B{r}:H{r}"); ws6.merge_cells(f"I{r}:L{r}")
-        dc(ws6,"B",r,lbl,bg,align="left",wrap=True,bold=("⚠" in lbl))
-        dc(ws6,"I",r,val,bg,bold=True); ws6.row_dimensions[r].height=22
+        # ── Cost variance
+        ws6.row_dimensions[13].height=10
+        sec(ws6,"COST VARIANCE vs. PLAN",14,"L",HDR_BG)
+        for col,txt,ec in [("B","Classification","F"),("G","Count","H"),("I","% of WOs","J"),("K","Assessment","L")]:
+            hdr(ws6,col,15,txt,ec)
+        ws6.row_dimensions[15].height=18
+        var_rows = [
+            ("Within Boundaries",                p6['within'], GREEN_FLG, "On track"),
+            ("Actual Cost is Lower than Planned", p6['below'],  GREEN_FLG, "Under plan — verify scope was completed"),
+            ("Actual Cost Exceeds Planned Cost",  p6['exceeds'],RED_FLG,  "Review WOs — scope creep or poor estimation"),
+        ]
+        tot_wos = p6['within'] + p6['below'] + p6['exceeds']
+        for i,(lbl,ct,bg,assess) in enumerate(var_rows):
+            r = 16+i
+            for mc in [f"B{r}:F{r}",f"G{r}:H{r}",f"I{r}:J{r}",f"K{r}:L{r}"]:
+                ws6.merge_cells(mc)
+            dc(ws6,"B",r,lbl,bg,bold=True,align="left"); dc(ws6,"G",r,ct,bg)
+            dc(ws6,"I",r,f"{100*ct/tot_wos:.0f}%" if tot_wos else "—",bg)
+            dc(ws6,"K",r,assess,bg,align="left",wrap=True); ws6.row_dimensions[r].height=22
 
-    ws6.row_dimensions[21].height=10
-    sec(ws6,"LABOR MIX: PLANNED vs. CORRECTIVE",22,"L",HDR_BG)
-    for col,txt,ec in [("B","Category","D"),("E","Hours","G"),("H","% of Total","J")]:
-        hdr(ws6,col,23,txt,ec)
-    ws6.row_dimensions[23].height=18
-    mix_rows = [
-        ("Planned (PM)",      p6['pm_hrs'],   p6['planned_pct'], GREEN_FLG),
-        ("Corrective (BKD+FUC)",p6['bkd_hrs']+p6['fuc_hrs'], p6['corr_pct'], RED_FLG if p6['corr_pct']>60 else ORANGE),
-        ("Total",             p6['all_hrs'],  100.0, MID_BG),
+        # ── Monthly cost chart data + chart
+        ws6.row_dimensions[20].height=10
+        sec(ws6,"MONTHLY SPEND TREND  (H1 2026)",21,"L",HDR_BG)
+        for i,(mo,cost) in enumerate(zip(p6['months_str'],p6['cost_mo'])):
+            ws6[f"O{22+i}"].value = mo; ws6[f"P{22+i}"].value = int(cost)
+        ws6["P21"].value = "Cost ($)"
+        bc6 = BarChart(); bc6.type="col"; bc6.title="Monthly Spend (H1 2026)"
+        bc6.y_axis.title="Cost ($)"; bc6.style=10; bc6.width=22; bc6.height=11
+        bc6.add_data(Reference(ws6,min_col=16,min_row=21,max_row=27),titles_from_data=True)
+        bc6.set_categories(Reference(ws6,min_col=15,min_row=22,max_row=27))
+        bc6.series[0].graphicalProperties.solidFill="2E75B6"
+        bc6.visible_cells_only = False
+        ws6.add_chart(bc6,"B22")
+        for col in ["O","P"]: ws6.column_dimensions[col].hidden = True
+
+        # ── Top cost WOs
+        r_top = 36; ws6.row_dimensions[r_top].height=10
+        sec(ws6,f"TOP {min(10,len(p6['top_wos']))} WOs BY COST",r_top+1,"L",HDR_BG)
+        for col,txt,ec in [("B","WO Number","C"),("D","Description","H"),
+                            ("I","Cost","J"),("K","vs. Plan","L")]:
+            hdr(ws6,col,r_top+2,txt,ec)
+        ws6.row_dimensions[r_top+2].height=18
+        for i,(_,row) in enumerate(p6['top_wos'].iterrows()):
+            r = r_top+3+i
+            classification = str(row['Actual Cost Classification']).strip()
+            bg = RED_FLG if 'Exceeds' in classification else LIGHT_ROW
+            for mc in [f"B{r}:C{r}",f"D{r}:H{r}",f"I{r}:J{r}",f"K{r}:L{r}"]:
+                ws6.merge_cells(mc)
+            dc(ws6,"B",r,str(row['Work Order Number']),bg)
+            dc(ws6,"D",r,row['Description'],bg,align="left")
+            dc(ws6,"I",r,f"${int(row['Cost per Work Order']):,}",bg,bold=True)
+            dc(ws6,"K",r,classification,bg,align="left",wrap=True)
+            ws6.row_dimensions[r].height=18
+
+        next_r = r_top + 3 + len(p6['top_wos']) + 1
+    else:
+        next_r = 8
+
+    # ── LABOR HOUR FLAG (always shown) ────────────────────────────────────────
+    ws6.row_dimensions[next_r].height=10
+    sec(ws6,"⚠  LABOR HOUR CAPTURE — ACTION REQUIRED",next_r+1,"L",RAG_RED)
+    ws6.merge_cells(f"B{next_r+2}:L{next_r+2}")
+    flag_msg = (f"Even with cost data available, labor HOURS are not being recorded on "
+                f"{p6['bkd_zero']}/{len(bkd)} Breakdown WOs ({p6['bkd_zero_pct']:.0f}%). "
+                f"Hours are required for MTTR calculation, technician productivity analysis, "
+                f"and scheduling. Cost alone does not show how long repairs took."
+                if p6['has_cost'] else
+                f"{p6['bkd_zero']}/{len(bkd)} Breakdown WOs ({p6['bkd_zero_pct']:.0f}%) have zero actual hours. "
+                f"Labor cost of failures cannot be assessed. MTTR cannot be calculated. "
+                f"Upload cost export to see dollar impact. Require technicians to book time on all GM02 WOs.")
+    dc(ws6,"B",next_r+2,flag_msg,RED_FLG,align="left",wrap=True,bold=True)
+    ws6.row_dimensions[next_r+2].height=40
+
+    for col,txt,ec in [("B","WO Type","D"),("E","Zero-Hr WOs","F"),("G","Zero-Hr %","H"),("I","Impact","L")]:
+        hdr(ws6,col,next_r+3,txt,ec)
+    ws6.row_dimensions[next_r+3].height=18
+    labor_rows = [
+        ("PM (GM09)",             p6['pm_zero'],   100*p6['pm_zero']/len(pm)   if len(pm)  else 0,
+         "✓ Good — PMs have hours" if p6['pm_zero']==0 else "Investigate missing PM hours", GREEN_FLG if p6['pm_zero']==0 else YELLOW),
+        ("Breakdown (GM02)",      p6['bkd_zero'],  p6['bkd_zero_pct'],
+         "MTTR unknown. Repair duration not tracked. Technician time invisible.", YELLOW),
+        ("Follow-up (GM01/PM01)", p6['fuc_zero'],  p6['fuc_zero_pct'],
+         "Separate parts-only WOs from labor WOs; audit remaining zero-hour entries.", ORANGE),
     ]
-    for i,(lbl,hrs,pct,bg) in enumerate(mix_rows):
-        r = 24+i
-        ws6.merge_cells(f"B{r}:D{r}"); ws6.merge_cells(f"E{r}:G{r}"); ws6.merge_cells(f"H{r}:J{r}")
-        dc(ws6,"B",r,lbl,bg,bold=True,align="left",color=WHITE if bg==MID_BG else "1F2D3D")
-        dc(ws6,"E",r,f"{hrs:.1f}",bg,color=WHITE if bg==MID_BG else "1F2D3D")
-        dc(ws6,"H",r,f"{pct:.0f}%",bg,bold=True,color=WHITE if bg==MID_BG else "1F2D3D")
-        ws6.row_dimensions[r].height=20
-    widths(ws6,{"A":2,"B":8,"C":8,"D":18,"E":8,"F":8,"G":8,"H":10,"I":4,"J":4,"K":14,"L":2})
+    for i,(wt,zh,zhp,impact,bg) in enumerate(labor_rows):
+        r = next_r+4+i
+        for mc in [f"B{r}:D{r}",f"E{r}:F{r}",f"G{r}:H{r}",f"I{r}:L{r}"]:
+            ws6.merge_cells(mc)
+        dc(ws6,"B",r,wt,bg,bold=True,align="left"); dc(ws6,"E",r,zh,bg)
+        dc(ws6,"G",r,f"{zhp:.0f}%",bg,bold=True)
+        dc(ws6,"I",r,impact,bg,align="left",wrap=True); ws6.row_dimensions[r].height=28
+
+    widths(ws6,{"A":2,"B":8,"C":8,"D":12,"E":8,"F":6,"G":8,"H":4,"I":8,"J":8,"K":14,"L":2})
 
     # ── SHEET 7: Pillar 7 — Equipment Reliability ─────────────────────────────
     ws7 = wb.create_sheet("7 · Reliability"); ws7.sheet_view.showGridLines = False
@@ -993,33 +1139,43 @@ st.set_page_config(page_title="PM Effectiveness App 1.0", page_icon="🔧", layo
 st.title("PM Effectiveness App 1.0")
 st.caption("Upload a Celonis export. Get a 7-pillar analysis workbook.")
 
-asset_label = st.text_input("Asset label", value="NEW MILFORD  ·  MBF01 | CARTONER")
-uploaded    = st.file_uploader("Upload Celonis Export (.xlsx)", type=["xlsx"])
+asset_label  = st.text_input("Asset label", value="NEW MILFORD  ·  MBF01 | CARTONER")
+
+col_a, col_b = st.columns(2)
+with col_a:
+    uploaded = st.file_uploader("Celonis WO Export (.xlsx) — required", type=["xlsx"])
+with col_b:
+    cost_uploaded = st.file_uploader("Celonis Cost Export (.xlsx) — optional", type=["xlsx"],
+                                     help="Enables Pillar 6 cost analysis. Join key: Work Order Number.")
 
 if uploaded:
     with st.spinner("Running analysis across 7 pillars…"):
         try:
             df, pm, bkd, fuc, ref_date = prep_data(uploaded)
 
+            cost_df = None
+            if cost_uploaded:
+                cost_df = pd.read_excel(cost_uploaded)
+
             p1 = pillar1_compliance(pm, bkd, fuc, df)
             p2 = pillar2_failure_prevention(pm, bkd)
             p3 = pillar3_coverage(pm, bkd)
             p4 = pillar4_wo_quality(pm, bkd, fuc)
             p5 = pillar5_backlog(df, ref_date)
-            p6 = pillar6_cost(pm, bkd, fuc, df)
+            p6 = pillar6_cost(pm, bkd, fuc, df, cost_df)
             p7 = pillar7_reliability(bkd, df, ref_date)
 
-            # Quick scorecard preview
-            st.success("Analysis complete.")
+            st.success("Analysis complete." + (" Cost data included." if cost_df is not None else " No cost file — upload cost export for Pillar 6."))
             cols = st.columns(7)
             for col_ui, pname, p_data in zip(cols, PILLARS, [p1,p2,p3,p4,p5,p6,p7]):
                 rag   = p_data['rag']
                 emoji = "🟢" if rag=="GREEN" else ("🟡" if rag=="AMBER" else "🔴")
                 col_ui.metric(pname.split(". ",1)[1], emoji)
 
-            output = build_workbook(df, pm, bkd, fuc, ref_date, asset_label, [p1,p2,p3,p4,p5,p6,p7])
+            output = build_workbook(df, pm, bkd, fuc, ref_date, asset_label,
+                                    [p1,p2,p3,p4,p5,p6,p7], cost_df=cost_df)
             from datetime import date
-            fname  = f"PM_Effectiveness_{date.today().strftime('%Y%m%d')}.xlsx"
+            fname = f"PM_Effectiveness_{date.today().strftime('%Y%m%d')}.xlsx"
             st.download_button(
                 label="⬇️ Download Analysis Workbook",
                 data=output, file_name=fname,
@@ -1029,11 +1185,15 @@ if uploaded:
             st.error(f"Analysis failed: {e}")
             import traceback; st.code(traceback.format_exc())
 
-with st.expander("Expected Celonis export columns"):
+with st.expander("Expected file formats"):
     st.markdown("""
-- `WorkOrderNumber`, `Description`, `OrderType`
+**WO Export (required)**
+- `WorkOrderNumber`, `Description`, `OrderType`, `System Status`
 - `Work order classification for preventive and corrective processing metrics`
-- `System Status`, `Created On`, `Basic Start Date`
-- `Actual Hours`, `SystemCondition`
-- `Planned Hours` *(optional — enables planned vs. actual variance analysis)*
+- `Created On`, `Basic Start Date`, `Actual Hours`, `SystemCondition`
+- `Planned Hours` *(optional — enables planned vs. actual variance)*
+
+**Cost Export (optional)**
+- `Work Order Number`, `Description`, `Cost per Work Order`
+- `Actual Cost Classification`, `Created On`
 """)
