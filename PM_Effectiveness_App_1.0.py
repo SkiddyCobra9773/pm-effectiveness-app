@@ -6,6 +6,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.series import DataPoint
 
 # ── palette ──────────────────────────────────────────────────────────────────
 DARK_BG   = "1F2D3D"; MID_BG  = "2E4057"; HDR_BG  = "3A5068"
@@ -87,16 +88,102 @@ def pfreq(d):
     if re.search(r'5W', d, re.IGNORECASE): return 35
     return None
 
-# ── cluster definitions ───────────────────────────────────────────────────────
-CLUSTERS = [
-    ("Glue System",           ['glue','nozzle','nordson','versa blue']),
-    ("Gearbox / Shaft",       ['gearbox','gear box','shaft']),
-    ("Pusher / Movement",     ['pusher','layer pusher']),
-    ("Fuses / Electrical",    ['fuse','vfd','not moving','electrical']),
-    ("Belts / Chains / Lugs", ['belt','chain','lug']),
-    ("Carton Handling",       ['carton','blow off']),
-    ("Drive / Other",         ['drive','resolver','wadding']),
-]
+# ── dynamic month window ─────────────────────────────────────────────────────
+def build_month_window(df):
+    """Derive month buckets from Basic Start Date range (the execution window)."""
+    all_dates = df['Basic Start Date'].dropna()
+    if all_dates.empty:
+        end   = pd.Timestamp.today()
+        start = end - pd.DateOffset(months=5)
+    else:
+        start = all_dates.min()
+        end   = all_dates.max()
+
+    periods    = pd.period_range(start=start, end=end, freq='M')
+    month_keys = [str(p) for p in periods]           # ['2025-01', ...]
+    n          = len(month_keys)
+    multi_year = periods[0].year != periods[-1].year
+
+    # Display labels: include year suffix when data spans >1 year
+    if multi_year or n > 12:
+        months_str = [p.strftime("%b '%y") for p in periods]
+    else:
+        months_str = [p.strftime('%b') for p in periods]
+
+    # Compact period label for chart/section titles
+    if n <= 6 and not multi_year:
+        h            = 'H1' if periods[-1].month <= 6 else 'H2'
+        period_label = f"{h} {periods[0].year}"
+    elif n <= 12 and not multi_year:
+        period_label = str(periods[0].year)
+    else:
+        period_label = f"{periods[0].strftime('%b %Y')} – {periods[-1].strftime('%b %Y')}"
+
+    last_period  = periods[-1]
+    window_start = f"{month_keys[0]}-01"
+    window_end   = f"{month_keys[-1]}-{last_period.days_in_month:02d}"
+
+    return {
+        'month_keys':   month_keys,
+        'months_str':   months_str,
+        'month_map':    {k: i for i, k in enumerate(month_keys)},
+        'n':            n,
+        'period_label': period_label,
+        'window_start': window_start,
+        'window_end':   window_end,
+    }
+
+
+# ── auto-cluster failure modes from breakdown descriptions ───────────────────
+def build_clusters_from_bkd(bkd, n_clusters=10):
+    """Derive failure clusters from BKD WO descriptions via term co-occurrence."""
+    from collections import Counter
+    NOISE = {
+        'and','the','of','in','on','for','to','a','an','is','not','no','with',
+        'or','replace','replacement','inspection','inspect','insp','service',
+        'check','pm','wr','wk','repair','clean','cleaning','preventive',
+        'maintenance','work','order','corrective','via','per','due','has',
+        'was','are','were','been','does','did','have','had','will','at','by',
+        'from','that','this','its','into','run','running','out','off','set',
+        'up','down','over','under','left','right','new','old','found',
+        'broken','failed','failure','issue','problem','faulty','worn',
+        'unit','time','date','area',
+    }
+    desc_word_sets = []
+    all_words      = []
+    for desc in bkd['Description'].dropna():
+        words = re.findall(r'[a-zA-Z]{3,}', desc.lower())
+        words = [w for w in words if w not in NOISE]
+        all_words.extend(words)
+        desc_word_sets.append(set(words))
+
+    if not all_words:
+        return [("General Breakdown", ['breakdown', 'failure'])]
+
+    freq       = Counter(all_words)
+    candidates = [w for w, _ in freq.most_common(80) if freq[w] >= 2]
+
+    clusters  = []
+    used      = set()
+    for seed in candidates:
+        if seed in used:
+            continue
+        seed_docs = [ws for ws in desc_word_sets if seed in ws]
+        if not seed_docs:
+            continue
+        co = [seed]
+        for other in candidates:
+            if other == seed or other in used:
+                continue
+            both = sum(1 for ws in desc_word_sets if seed in ws and other in ws)
+            if both >= max(2, len(seed_docs) * 0.4):
+                co.append(other)
+        clusters.append((seed.replace('-',' ').title(), co))
+        used.update(co)
+        if len(clusters) >= n_clusters:
+            break
+
+    return clusters if clusters else [("General", ['breakdown'])]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA PREPARATION
@@ -131,12 +218,12 @@ def prep_data(file_obj):
 # PILLAR ANALYSIS FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def pillar1_compliance(pm, bkd, fuc, df):
+def pillar1_compliance(pm, bkd, fuc, df, mw):
     """Compliance & Scheduling"""
     teco_pct = pm['is_TECO'].mean() * 100 if len(pm) else 0
 
-    # Schedule adherence
-    pm_h1 = pm[pm['Basic Start Date'].between('2026-01-01','2026-06-30')].copy()
+    # Schedule adherence — window-filtered
+    pm_h1 = pm[pm['Basic Start Date'].between(mw['window_start'], mw['window_end'])].copy()
     sched_rows = []
     for desc, grp in pm_h1.groupby('Description'):
         grp = grp.sort_values('Basic Start Date'); interval = pfreq(desc)
@@ -165,8 +252,7 @@ def pillar1_compliance(pm, bkd, fuc, df):
     else:
         on_time = early = late_ct = total_i = 0; adh_pct = 0; by_type = pd.DataFrame()
 
-    # Cycle time: Created On → Basic Start Date (for completed), Created On → ref for open
-    # Use Basic Start Date as proxy for work start
+    # Cycle time: Created On → Basic Start Date
     pm_with_dates = pm.dropna(subset=['Created On','Basic Start Date']).copy()
     pm_with_dates['Cycle_Days'] = (pm_with_dates['Basic Start Date'] - pm_with_dates['Created On']).dt.days
     pm_with_dates = pm_with_dates[pm_with_dates['Cycle_Days'] >= 0]
@@ -175,6 +261,16 @@ def pillar1_compliance(pm, bkd, fuc, df):
     ct_7_30 = ((pm_with_dates['Cycle_Days'] > 7) & (pm_with_dates['Cycle_Days'] <= 30)).sum()
     ct_30p  = (pm_with_dates['Cycle_Days'] > 30).sum()
 
+    # Actual hours by PM task
+    pm_task_hrs = pm.groupby('Description').agg(
+        Count=('WorkOrderNumber','count'),
+        Total_Hrs=('Actual Hours','sum'),
+        Avg_Hrs=('Actual Hours','mean'),
+        Zero_Hr=('Actual Hours', lambda x: (x==0).sum())
+    ).reset_index()
+    pm_task_hrs['Zero_Pct'] = (pm_task_hrs['Zero_Hr'] / pm_task_hrs['Count'] * 100).round(0).astype(int)
+    pm_task_hrs = pm_task_hrs.sort_values('Total_Hrs', ascending=False).reset_index(drop=True)
+
     # RAG
     rag = "GREEN" if (teco_pct >= 90 and adh_pct >= 80) else ("AMBER" if (teco_pct >= 75 or adh_pct >= 65) else "RED")
 
@@ -182,19 +278,21 @@ def pillar1_compliance(pm, bkd, fuc, df):
         'teco_pct': teco_pct, 'adh_pct': adh_pct,
         'on_time': on_time, 'early': early, 'late_ct': late_ct, 'total_i': total_i,
         'avg_cycle': avg_cycle, 'ct_lt7': ct_lt7, 'ct_7_30': ct_7_30, 'ct_30p': ct_30p,
-        'sched': sched, 'by_type': by_type, 'rag': rag,
+        'sched': sched, 'by_type': by_type, 'pm_task_hrs': pm_task_hrs,
+        'rag': rag,
         'key_metric': f"TECO {teco_pct:.0f}%  |  Adherence {adh_pct:.0f}%",
     }
 
 
-def pillar2_failure_prevention(pm, bkd):
+def pillar2_failure_prevention(pm, bkd, mw):
     """Failure Prevention"""
-    months_str = ['Jan','Feb','Mar','Apr','May','Jun']
-    month_keys = ['2026-01','2026-02','2026-03','2026-04','2026-05','2026-06']
-    month_map  = {k: i for i, k in enumerate(month_keys)}
+    months_str = mw['months_str']
+    month_keys = mw['month_keys']
+    month_map  = mw['month_map']
+    n_mo       = mw['n']
 
-    bkd_mo = [0]*6
-    bkd_h1 = bkd[bkd['Basic Start Date'].between('2026-01-01','2026-06-30')].dropna(subset=['Basic Start Date'])
+    bkd_mo = [0]*n_mo
+    bkd_h1 = bkd[bkd['Basic Start Date'].between(mw['window_start'], mw['window_end'])].dropna(subset=['Basic Start Date'])
     for _, row in bkd_h1.iterrows():
         k = row['Basic Start Date'].strftime('%Y-%m')
         if k in month_map: bkd_mo[month_map[k]] += 1
@@ -218,8 +316,11 @@ def pillar2_failure_prevention(pm, bkd):
         rolling_3.append(round(np.mean(window),1) if window else 0)
 
     h1_vals    = [m for m in mtbf_30 if m > 0]
-    first3     = np.mean([m for m in mtbf_30[:3] if m > 0]) if any(m>0 for m in mtbf_30[:3]) else 0
-    last3      = np.mean([m for m in mtbf_30[3:] if m > 0]) if any(m>0 for m in mtbf_30[3:]) else 0
+    mid        = max(1, n_mo // 2)
+    first_half = [m for m in mtbf_30[:mid]  if m > 0]
+    last_half  = [m for m in mtbf_30[mid:]  if m > 0]
+    first3     = np.mean(first_half) if first_half else 0
+    last3      = np.mean(last_half)  if last_half  else 0
     if first3 and last3:
         pct_chg = (last3-first3)/first3*100
         trend_dir = "Improving ↑" if pct_chg > 10 else ("Declining ↓" if pct_chg < -10 else "Stable →")
@@ -228,6 +329,41 @@ def pillar2_failure_prevention(pm, bkd):
         pct_chg = 0; trend_dir = "Insufficient data"; trend_clr = "AMBER"
 
     overall_mtbf = round(np.mean(h1_vals),1) if h1_vals else 0
+
+    # Monthly PM count — window
+    pm_mo = [0]*n_mo
+    pm_h1 = pm[pm['Basic Start Date'].between(mw['window_start'], mw['window_end'])].dropna(subset=['Basic Start Date'])
+    for _, row in pm_h1.iterrows():
+        k = row['Basic Start Date'].strftime('%Y-%m')
+        if k in month_map: pm_mo[month_map[k]] += 1
+
+    # PM:BKD correlation (Pearson) — higher PM count, fewer BKDs?
+    if sum(pm_mo) > 0 and sum(bkd_mo) > 0:
+        pm_arr  = np.array(pm_mo,  dtype=float)
+        bkd_arr = np.array(bkd_mo, dtype=float)
+        corr_coef = float(np.corrcoef(pm_arr, bkd_arr)[0,1])
+    else:
+        corr_coef = 0.0
+    corr_interp = ("Negative — more PMs associated with fewer breakdowns ✓" if corr_coef < -0.3
+                   else "Positive — PMs and breakdowns trending together (review PM effectiveness)" if corr_coef > 0.3
+                   else "No clear linear relationship")
+
+    # Per-task: how often does a BKD occur within 7 days after this PM task?
+    task_corr_rows = []
+    for desc, grp in pm_h1.groupby('Description'):
+        grp = grp.sort_values('Basic Start Date')
+        bkd_after = 0
+        for _, pm_row in grp.iterrows():
+            win_end = pm_row['Basic Start Date'] + pd.Timedelta(days=7)
+            nearby  = bkd[(bkd['Basic Start Date'] > pm_row['Basic Start Date']) &
+                          (bkd['Basic Start Date'] <= win_end)]
+            if len(nearby) > 0: bkd_after += 1
+        task_corr_rows.append({
+            'PM_Task': desc, 'PM_Count': len(grp),
+            'BKD_Within_7d': bkd_after,
+            'BKD_Rate_Pct': round(100*bkd_after/len(grp), 0) if len(grp) else 0,
+        })
+    task_corr = pd.DataFrame(task_corr_rows).sort_values('BKD_Rate_Pct', ascending=False).reset_index(drop=True)
 
     # PM→Breakdown pairs
     pm_bkd_rows = []
@@ -244,13 +380,14 @@ def pillar2_failure_prevention(pm, bkd):
             'Days': days, 'Category': cat})
     pm_bkd = pd.DataFrame(pm_bkd_rows) if pm_bkd_rows else pd.DataFrame()
 
-    rag = trend_clr  # trend is the main signal
+    rag = trend_clr
 
     return {
-        'months_str': months_str, 'bkd_mo': bkd_mo,
+        'months_str': months_str, 'bkd_mo': bkd_mo, 'pm_mo': pm_mo,
         'mtbf_30': mtbf_30, 'mtbf_actual': mtbf_actual, 'rolling_3': rolling_3,
         'overall_mtbf': overall_mtbf, 'trend_dir': trend_dir, 'trend_clr': trend_clr,
         'pct_chg': pct_chg, 'pm_bkd': pm_bkd,
+        'corr_coef': corr_coef, 'corr_interp': corr_interp, 'task_corr': task_corr,
         'rag': rag,
         'key_metric': f"MTBF {overall_mtbf}d  |  Trend {trend_dir}",
     }
@@ -259,9 +396,10 @@ def pillar2_failure_prevention(pm, bkd):
 def pillar3_coverage(pm, bkd):
     """Failure Mode Coverage"""
     pm_descs_lower = ' '.join(pm['Description'].fillna('').str.lower().tolist())
+    clusters       = build_clusters_from_bkd(bkd)
 
     coverage_rows = []
-    for name, keywords in CLUSTERS:
+    for name, keywords in clusters:
         bkd_mask = bkd['Description'].str.lower().str.contains('|'.join(keywords), na=False)
         bkd_count = bkd_mask.sum()
         pm_covered = any(kw in pm_descs_lower for kw in keywords)
@@ -323,7 +461,7 @@ def pillar4_wo_quality(pm, bkd, fuc):
     }
 
 
-def pillar5_backlog(df, ref_date):
+def pillar5_backlog(df, ref_date, mw):
     """Backlog Health"""
     open_df = df[df['is_open']].copy()
     open_df['Age_Days'] = (ref_date - open_df['Created On']).dt.days.clip(lower=0)
@@ -340,10 +478,10 @@ def pillar5_backlog(df, ref_date):
     avg_age    = open_df['Age_Days'].mean() if total_open else 0
     oldest_age = open_df['Age_Days'].max() if total_open else 0
 
-    # Monthly new WOs vs TECO'd (H1 2026) to show backlog trend
-    months_str = ['Jan','Feb','Mar','Apr','May','Jun']
-    month_keys = ['2026-01','2026-02','2026-03','2026-04','2026-05','2026-06']
-    new_mo = [0]*6; closed_mo = [0]*6
+    # Monthly new WOs vs TECO'd — window
+    months_str = mw['months_str']
+    month_keys = mw['month_keys']
+    new_mo = [0]*mw['n']; closed_mo = [0]*mw['n']
     for _, row in df.iterrows():
         k = row['Created On'].strftime('%Y-%m') if pd.notna(row['Created On']) else None
         if k in month_keys: new_mo[month_keys.index(k)] += 1
@@ -370,7 +508,7 @@ def pillar5_backlog(df, ref_date):
     }
 
 
-def pillar6_cost(pm, bkd, fuc, df, cost_df=None):
+def pillar6_cost(pm, bkd, fuc, df, cost_df=None, mw=None):
     """Cost Visibility — enhanced with cost export when available"""
     # ── labor hour analysis (always) ──
     bkd_zero     = (bkd['Actual Hours'] == 0).sum()
@@ -412,9 +550,10 @@ def pillar6_cost(pm, bkd, fuc, df, cost_df=None):
         below    = vc.get('Actual Cost is Lower than Planned Cost', 0)
         exceed_pct = 100*exceeds/len(cost_df) if len(cost_df) else 0
 
-        # Monthly cost trend (H1 2026)
-        month_keys = ['2026-01','2026-02','2026-03','2026-04','2026-05','2026-06']
-        months_str = ['Jan','Feb','Mar','Apr','May','Jun']
+        # Monthly cost trend — window
+        _mw = mw if mw else build_month_window(df)
+        month_keys = _mw['month_keys']
+        months_str = _mw['months_str']
         merged['Month'] = pd.to_datetime(merged['Created On'], errors='coerce').dt.to_period('M').astype(str)
         cost_mo = []
         for mk in month_keys:
@@ -443,7 +582,8 @@ def pillar6_cost(pm, bkd, fuc, df, cost_df=None):
         total_cost = pm_cost = bkd_cost = fuc_cost = 0
         avg_pm_cost = avg_bkd_cost = cost_ratio = 0
         exceeds = within = below = exceed_pct = 0
-        cost_mo = [0]*6; months_str = ['Jan','Feb','Mar','Apr','May','Jun']
+        _mw = mw if mw else build_month_window(df)
+        cost_mo = [0]*_mw['n']; months_str = _mw['months_str']
         top_wos = pd.DataFrame(); merged = df.copy()
         cost_no_hrs_bkd = pd.DataFrame()
         rag = "RED" if bkd_zero_pct > 50 else ("AMBER" if bkd_zero_pct > 20 else "GREEN")
@@ -465,7 +605,7 @@ def pillar6_cost(pm, bkd, fuc, df, cost_df=None):
     }
 
 
-def pillar7_reliability(bkd, df, ref_date):
+def pillar7_reliability(bkd, df, ref_date, mw):
     """Equipment Reliability — MTBF + MTTR"""
     bkd_sorted = bkd.dropna(subset=['Basic Start Date']).sort_values('Basic Start Date')
     bd_dates   = bkd_sorted['Basic Start Date'].tolist()
@@ -480,11 +620,11 @@ def pillar7_reliability(bkd, df, ref_date):
     mttr_n       = len(bkd_with_hrs)
     mttr_note    = f"Based on {mttr_n}/{len(bkd)} BKD WOs with actual hours recorded" if mttr else "No actual hours on BKD WOs — MTTR cannot be calculated"
 
-    # Breakdown rate by month (H1 2026)
-    months_str = ['Jan','Feb','Mar','Apr','May','Jun']
-    month_keys = ['2026-01','2026-02','2026-03','2026-04','2026-05','2026-06']
-    bkd_mo = [0]*6
-    bkd_h1 = bkd[bkd['Basic Start Date'].between('2026-01-01','2026-06-30')].dropna(subset=['Basic Start Date'])
+    # Breakdown rate by month — window
+    months_str = mw['months_str']
+    month_keys = mw['month_keys']
+    bkd_mo     = [0]*mw['n']
+    bkd_h1     = bkd[bkd['Basic Start Date'].between(mw['window_start'], mw['window_end'])].dropna(subset=['Basic Start Date'])
     for _, row in bkd_h1.iterrows():
         k = row['Basic Start Date'].strftime('%Y-%m')
         if k in month_keys: bkd_mo[month_keys.index(k)] += 1
@@ -515,8 +655,11 @@ def pillar7_reliability(bkd, df, ref_date):
 # ═════════════════════════════════════════════════════════════════════════════
 # WORKBOOK BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
-def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=None):
+def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=None, mw=None):
     p1, p2, p3, p4, p5, p6, p7 = analyses
+    if mw is None: mw = build_month_window(df)
+    n_mo = mw['n']
+    pl   = mw['period_label']   # e.g. "H1 2026" or "Jan 2025 – Jun 2026"
     date_range = (f"{df['Created On'].min().strftime('%b %Y')}–"
                   f"{df['Created On'].max().strftime('%b %Y')}")
     wb = Workbook()
@@ -569,8 +712,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     findings = [
         f"{red_count} pillar(s) RED / {amb_count} AMBER — see detail tabs for corrective actions.",
         f"PM compliance: {p1['teco_pct']:.0f}% TECO rate across {len(pm)} PM WOs. Schedule adherence: {p1['adh_pct']:.0f}%.",
-        f"MTBF: {p7['mtbf_overall']} days overall (H1 2026). Trend: {p2['trend_dir']}.",
-        f"{p3['gaps']} of {len(CLUSTERS)} failure clusters have no corresponding PM task.",
+        f"MTBF: {p7['mtbf_overall']} days overall ({pl}). Trend: {p2['trend_dir']}.",
+        f"{p3['gaps']} of {len(p3['cov_df'])} failure clusters have no corresponding PM task.",
         f"⚠  {p4['bkd_zero']}/{total_bkds} breakdown WOs carry zero actual hours — failure labor cost is largely invisible.",
         f"Backlog: {p5['total_open']} open WOs, avg age {p5['avg_age']:.0f} days, {p5['age_91p']} aged 90+ days.",
     ]
@@ -604,7 +747,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         ws1[f"{col}5"].fill = wfill(bg); ws1[f"{col}5"].alignment = cal(); ws1[f"{col}5"].border = bdr()
     ws1.row_dimensions[4].height=16; ws1.row_dimensions[5].height=30; ws1.row_dimensions[6].height=10
 
-    sec(ws1,"SCHEDULE ADHERENCE BY PM TASK  (H1 2026)",7,"L")
+    sec(ws1,f"SCHEDULE ADHERENCE BY PM TASK  ({pl})",7,"L")
     for col,txt,ec in [("B","PM Task","D"),("E","Expected","F"),("G","Intervals","H"),
                         ("I","Avg Gap","J"),("K","Avg Variance","L"),("M","On-Time %",None)]:
         hdr(ws1,col,8,txt,ec)
@@ -637,7 +780,42 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws1,"B",r,lbl,bg,bold=True); dc(ws1,"D",r,ct,bg)
         dc(ws1,"F",r,f"{100*ct/ct_total:.0f}%" if ct_total else "—",bg)
         ws1.row_dimensions[r].height=18
-    widths(ws1,{"A":2,"B":8,"C":8,"D":20,"E":4,"F":12,"G":4,"H":12,"I":12,"J":4,"K":16,"L":4,"M":12})
+
+    # ── Actual hours by PM task ──
+    r_hrs = row_ct + 7; ws1.row_dimensions[r_hrs].height=10
+    sec(ws1,"ACTUAL HOURS ENTERED BY PM TASK",r_hrs+1,"M")
+    for col,txt,ec in [("B","PM Task Description","E"),("F","WO Count","G"),
+                        ("H","Total Hours","I"),("J","Avg Hrs / WO","K"),
+                        ("L","Zero-Hr WOs","M")]:
+        hdr(ws1,col,r_hrs+2,txt,ec)
+    ws1.row_dimensions[r_hrs+2].height=18
+    total_pm_hrs = p1['pm_task_hrs']['Total_Hrs'].sum()
+    for i,(_,row) in enumerate(p1['pm_task_hrs'].iterrows()):
+        r = r_hrs+3+i
+        bg = RED_FLG if row['Zero_Hr']>0 else (GREEN_FLG if row['Total_Hrs']>0 else LIGHT_ROW)
+        bg = LIGHT_ROW if i%2==0 and row['Zero_Hr']==0 else bg
+        for mc in [f"B{r}:E{r}",f"F{r}:G{r}",f"H{r}:I{r}",f"J{r}:K{r}",f"L{r}:M{r}"]:
+            ws1.merge_cells(mc)
+        dc(ws1,"B",r,row['Description'],bg,align="left")
+        dc(ws1,"F",r,int(row['Count']),bg)
+        dc(ws1,"H",r,f"{row['Total_Hrs']:.1f}",bg,bold=True)
+        dc(ws1,"J",r,f"{row['Avg_Hrs']:.2f}",bg)
+        dc(ws1,"L",r,f"{int(row['Zero_Hr'])} ({int(row['Zero_Pct'])}%)",
+           YELLOW if row['Zero_Hr']>0 else GREEN_FLG, bold=(row['Zero_Hr']>0))
+        ws1.row_dimensions[r].height=20
+    # Total row
+    r_tot = r_hrs+3+len(p1['pm_task_hrs'])
+    for mc in [f"B{r_tot}:E{r_tot}",f"F{r_tot}:G{r_tot}",f"H{r_tot}:I{r_tot}",
+               f"J{r_tot}:K{r_tot}",f"L{r_tot}:M{r_tot}"]:
+        ws1.merge_cells(mc)
+    pm_zero_total = p1['pm_task_hrs']['Zero_Hr'].sum()
+    dc(ws1,"B",r_tot,"Total",MID_BG,bold=True,align="left",color=WHITE)
+    dc(ws1,"F",r_tot,int(p1['pm_task_hrs']['Count'].sum()),MID_BG,color=WHITE)
+    dc(ws1,"H",r_tot,f"{total_pm_hrs:.1f}",MID_BG,bold=True,color=WHITE)
+    dc(ws1,"J",r_tot,f"{total_pm_hrs/p1['pm_task_hrs']['Count'].sum():.2f}" if p1['pm_task_hrs']['Count'].sum() else "—",MID_BG,color=WHITE)
+    dc(ws1,"L",r_tot,f"{int(pm_zero_total)} ({int(100*pm_zero_total/p1['pm_task_hrs']['Count'].sum())}%)" if p1['pm_task_hrs']['Count'].sum() else "—",MID_BG,color=WHITE)
+    ws1.row_dimensions[r_tot].height=20
+    widths(ws1,{"A":2,"B":10,"C":10,"D":10,"E":10,"F":10,"G":4,"H":12,"I":4,"J":12,"K":4,"L":16,"M":4})
 
     # ── SHEET 2: Pillar 2 — Failure Prevention ───────────────────────────────
     ws2 = wb.create_sheet("2 · Failure Prevention"); ws2.sheet_view.showGridLines = False
@@ -647,7 +825,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
 
     for col,lbl,val,bg in [
         ("B","Overall MTBF",f"{p2['overall_mtbf']} days",rag_bg(p7['rag'])),
-        ("F","H1 2026 Trend",p2['trend_dir'],rag_bg(p2['trend_clr'])),
+        ("F",f"{pl} Trend",p2['trend_dir'],rag_bg(p2['trend_clr'])),
         ("J","PM→BKD Pairs",str(len(p2['pm_bkd'])),LIGHT_ROW),
     ]:
         ec = chr(ord(col)+2)
@@ -676,7 +854,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             trend = "—"; tbg = bg
         ws2.merge_cells(f"B{r}:C{r}"); ws2.merge_cells(f"D{r}:E{r}"); ws2.merge_cells(f"F{r}:G{r}")
         ws2.merge_cells(f"H{r}:I{r}"); ws2.merge_cells(f"J{r}:K{r}"); ws2.merge_cells(f"L{r}:L{r}")
-        dc(ws2,"B",r,mo+" 2026",bg,bold=True); dc(ws2,"D",r,bkd_c,bg)
+        dc(ws2,"B",r,mo,bg,bold=True); dc(ws2,"D",r,bkd_c,bg)
         dc(ws2,"F",r,f"{m30}d" if m30 else "—",bg)
         dc(ws2,"H",r,f"{ma}d" if ma else "—",bg)
         dc(ws2,"J",r,f"{r3}d" if r3 else "—",bg)
@@ -688,22 +866,24 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         ws2[f"O{9+i}"].value = mo; ws2[f"P{9+i}"].value = m30; ws2[f"Q{9+i}"].value = r3
     ws2["P8"].value = "MTBF (30d)"; ws2["Q8"].value = "Rolling 3mo Avg"
 
-    ws2.row_dimensions[17].height=10
-    sec(ws2,"MTBF TREND  (H1 2026)",17,"L",HDR_BG)
-    lc = LineChart(); lc.title="MTBF Trend with 3-Month Rolling Avg"; lc.style=10; lc.width=22; lc.height=12
+    r_lc2 = 9 + n_mo + 1
+    ws2.row_dimensions[r_lc2].height=10
+    sec(ws2,f"MTBF TREND  ({pl})",r_lc2,"L",HDR_BG)
+    lc = LineChart(); lc.title="MTBF Trend with 3-Month Rolling Avg"; lc.style=10
+    lc.width = min(22 + max(0, n_mo-6)*2, 38); lc.height=12
     lc.y_axis.title="Days Between Breakdowns"
-    lc.add_data(Reference(ws2,min_col=16,min_row=8,max_row=14),titles_from_data=True)
-    lc.add_data(Reference(ws2,min_col=17,min_row=8,max_row=14),titles_from_data=True)
-    lc.set_categories(Reference(ws2,min_col=15,min_row=9,max_row=14))
+    lc.add_data(Reference(ws2,min_col=16,min_row=8,max_row=8+n_mo),titles_from_data=True)
+    lc.add_data(Reference(ws2,min_col=17,min_row=8,max_row=8+n_mo),titles_from_data=True)
+    lc.set_categories(Reference(ws2,min_col=15,min_row=9,max_row=8+n_mo))
     lc.series[0].graphicalProperties.line.solidFill="2E75B6"; lc.series[0].graphicalProperties.line.width=28575
     lc.series[0].marker.symbol="circle"; lc.series[0].marker.size=7
     lc.series[1].graphicalProperties.line.solidFill="ED7D31"; lc.series[1].graphicalProperties.line.width=19050
     lc.visible_cells_only = False
-    ws2.add_chart(lc,"B18")
+    ws2.add_chart(lc,f"B{r_lc2+1}")
     for col in ["O","P","Q"]: ws2.column_dimensions[col].hidden = True
 
-    # PM→BKD summary
-    r_pb = 33; ws2.row_dimensions[r_pb].height=10
+    # PM→BKD summary — placed after chart (chart ≈ 18 rows tall)
+    r_pb = max(33, r_lc2 + 20); ws2.row_dimensions[r_pb].height=10
     sec(ws2,"PM → BREAKDOWN TIMING SUMMARY",r_pb+1,"L",HDR_BG)
     cat_clr = {"Same day": GREEN_FLG,"1-3 days": RED_FLG,"4-7 days": ORANGE,"8+ days": LIGHT_ROW}
     if len(p2['pm_bkd']):
@@ -724,7 +904,30 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             dc(ws2,"B",r,cat,bg,bold=True); dc(ws2,"E",r,ct,bg)
             dc(ws2,"G",r,f"{100*ct/len(p2['pm_bkd']):.0f}%",bg)
             dc(ws2,"I",r,interp,bg,align="left",wrap=True); ws2.row_dimensions[r].height=22
-    widths(ws2,{"A":2,"B":8,"C":4,"D":8,"E":8,"F":4,"G":14,"H":4,"I":14,"J":10,"K":4,"L":12})
+    # PM → Breakdown Correlation
+    r_corr = r_pb + 8; ws2.row_dimensions[r_corr].height=10
+    sec(ws2,"PM → BREAKDOWN CORRELATION ANALYSIS",r_corr+1,"L",HDR_BG)
+    corr_bg = GREEN_FLG if p2['corr_coef'] < -0.3 else (RED_FLG if p2['corr_coef'] > 0.3 else ORANGE)
+    ws2.merge_cells(f"B{r_corr+2}:E{r_corr+2}"); ws2.merge_cells(f"F{r_corr+2}:L{r_corr+2}")
+    dc(ws2,"B",r_corr+2,"Pearson r (monthly PM count vs BKD count)",HDR_BG,align="left",bold=True)
+    dc(ws2,"F",r_corr+2,f"{p2['corr_coef']:+.2f}  —  {p2['corr_interp']}",corr_bg,align="left")
+    ws2.row_dimensions[r_corr+2].height=22
+    if len(p2['task_corr']):
+        hdr_r = r_corr+3
+        for col,txt,ec in [("B","PM Task","F"),("G","PM Count","H"),("I","BKDs w/in 7d","J"),("K","BKD Rate %","L")]:
+            hdr(ws2,col,hdr_r,txt,ec)
+        ws2.row_dimensions[hdr_r].height=18
+        for i,(_,row) in enumerate(p2['task_corr'].iterrows()):
+            r = hdr_r+1+i
+            bg = RED_FLG if row['BKD_Rate_Pct']>=50 else (ORANGE if row['BKD_Rate_Pct']>=25 else LIGHT_ROW)
+            ws2.merge_cells(f"B{r}:F{r}"); ws2.merge_cells(f"G{r}:H{r}")
+            ws2.merge_cells(f"I{r}:J{r}"); ws2.merge_cells(f"K{r}:L{r}")
+            dc(ws2,"B",r,row['PM_Task'],bg,align="left",wrap=True)
+            dc(ws2,"G",r,int(row['PM_Count']),bg)
+            dc(ws2,"I",r,int(row['BKD_Within_7d']),bg)
+            dc(ws2,"K",r,f"{int(row['BKD_Rate_Pct'])}%",bg,bold=True)
+            ws2.row_dimensions[r].height=22
+    widths(ws2,{"A":2,"B":10,"C":4,"D":8,"E":8,"F":4,"G":14,"H":4,"I":28,"J":10,"K":4,"L":14})
 
     # ── SHEET 3: Pillar 3 — Failure Mode Coverage ─────────────────────────────
     ws3 = wb.create_sheet("3 · Coverage Gap"); ws3.sheet_view.showGridLines = False
@@ -735,7 +938,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     for col,lbl,val,bg in [
         ("B","Coverage Gaps",str(p3['gaps']),rag_bg("GREEN" if p3['gaps']==0 else "RED")),
         ("F","High Priority Gaps",str(p3['high_gaps']),rag_bg("GREEN" if p3['high_gaps']==0 else "RED")),
-        ("J","Clusters Analyzed",str(len(CLUSTERS)),LIGHT_ROW),
+        ("J","Clusters Analyzed",str(len(p3['cov_df'])),LIGHT_ROW),
     ]:
         ec = chr(ord(col)+2)
         ws3.merge_cells(f"{col}4:{ec}4"); ws3[f"{col}4"].value=lbl
@@ -835,7 +1038,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws4,"B",15,
            "Planned Hours column not found in Celonis export. Add 'Planned Hours' to the export to enable this analysis.",
            YELLOW,align="left",wrap=True); ws4.row_dimensions[15].height=28
-    widths(ws4,{"A":2,"B":8,"C":8,"D":16,"E":8,"F":8,"G":10,"H":4,"I":10,"J":4,"K":26,"L":2})
+    widths(ws4,{"A":2,"B":8,"C":8,"D":20,"E":10,"F":8,"G":10,"H":4,"I":10,"J":4,"K":30,"L":2})
 
     # ── SHEET 5: Pillar 5 — Backlog Health ───────────────────────────────────
     ws5 = wb.create_sheet("5 · Backlog Health"); ws5.sheet_view.showGridLines = False
@@ -886,7 +1089,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
 
     r_ch = 15 + len(p5['by_type']) + 2
     ws5.row_dimensions[r_ch].height=10
-    sec(ws5,"MONTHLY NEW vs. CLOSED WOs (H1 2026)",r_ch+1,"L",HDR_BG)
+    sec(ws5,f"MONTHLY NEW vs. CLOSED WOs ({pl})",r_ch+1,"L",HDR_BG)
     for i,(mo,nw,cl,nt) in enumerate(zip(p5['months_str'],p5['new_mo'],p5['closed_mo'],p5['net_mo'])):
         ws5[f"O{r_ch+2+i}"].value = mo
         ws5[f"P{r_ch+2+i}"].value = nw
@@ -895,16 +1098,19 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     ws5[f"P{r_ch+1}"].value = "New WOs"
     ws5[f"Q{r_ch+1}"].value = "Closed (TECO)"
     bc5 = BarChart(); bc5.type="col"; bc5.grouping="clustered"
-    bc5.title="Monthly New vs. TECO'd WOs (H1 2026)"; bc5.style=10; bc5.width=22; bc5.height=12
-    bc5.add_data(Reference(ws5,min_col=16,min_row=r_ch+1,max_row=r_ch+7),titles_from_data=True)
-    bc5.add_data(Reference(ws5,min_col=17,min_row=r_ch+1,max_row=r_ch+7),titles_from_data=True)
-    bc5.set_categories(Reference(ws5,min_col=15,min_row=r_ch+2,max_row=r_ch+7))
+    bc5.title=f"Monthly New vs. TECO'd WOs ({pl})"; bc5.style=10
+    bc5.width = min(22 + max(0, n_mo-6)*2, 38); bc5.height=12
+    bc5.add_data(Reference(ws5,min_col=16,min_row=r_ch+1,max_row=r_ch+1+n_mo),titles_from_data=True)
+    bc5.add_data(Reference(ws5,min_col=17,min_row=r_ch+1,max_row=r_ch+1+n_mo),titles_from_data=True)
+    bc5.set_categories(Reference(ws5,min_col=15,min_row=r_ch+2,max_row=r_ch+1+n_mo))
     bc5.series[0].graphicalProperties.solidFill="2E75B6"
     bc5.series[1].graphicalProperties.solidFill="375623"
     bc5.visible_cells_only = False
+    from openpyxl.chart.legend import Legend as _Legend
+    bc5.legend = _Legend(); bc5.legend.legendPos = 'b'
     ws5.add_chart(bc5,f"B{r_ch+2}")
     for col in ["O","P","Q"]: ws5.column_dimensions[col].hidden = True
-    widths(ws5,{"A":2,"B":8,"C":8,"D":16,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":8,"L":2})
+    widths(ws5,{"A":2,"B":10,"C":8,"D":16,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":8,"L":2})
 
     # ── SHEET 6: Pillar 6 — Cost Visibility ──────────────────────────────────
     ws6 = wb.create_sheet("6 · Cost Visibility"); ws6.sheet_view.showGridLines = False
@@ -994,15 +1200,19 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
 
         # ── Monthly cost chart data + chart
         ws6.row_dimensions[20].height=10
-        sec(ws6,"MONTHLY SPEND TREND  (H1 2026)",21,"L",HDR_BG)
+        sec(ws6,f"MONTHLY SPEND TREND  ({pl})",21,"L",HDR_BG)
         for i,(mo,cost) in enumerate(zip(p6['months_str'],p6['cost_mo'])):
             ws6[f"O{22+i}"].value = mo; ws6[f"P{22+i}"].value = int(cost)
         ws6["P21"].value = "Cost ($)"
-        bc6 = BarChart(); bc6.type="col"; bc6.title="Monthly Spend (H1 2026)"
-        bc6.y_axis.title="Cost ($)"; bc6.style=10; bc6.width=22; bc6.height=11
-        bc6.add_data(Reference(ws6,min_col=16,min_row=21,max_row=27),titles_from_data=True)
-        bc6.set_categories(Reference(ws6,min_col=15,min_row=22,max_row=27))
-        bc6.series[0].graphicalProperties.solidFill="2E75B6"
+        bc6 = BarChart(); bc6.type="col"; bc6.title=f"Monthly Spend ({pl})"
+        bc6.y_axis.title="Cost ($)"; bc6.style=10
+        bc6.width = min(22 + max(0, n_mo-6)*2, 38); bc6.height=11
+        bc6.add_data(Reference(ws6,min_col=16,min_row=21,max_row=21+n_mo),titles_from_data=True)
+        bc6.set_categories(Reference(ws6,min_col=15,min_row=22,max_row=21+n_mo))
+        _BAR_PALETTE = ["2E75B6","4472C4","5B9BD5","70AD47","ED7D31","C00000","A9D18E","F4B942","833C11","0070C0","843C0C","595959"]
+        for _idx in range(n_mo):
+            _pt = DataPoint(idx=_idx); _pt.graphicalProperties.solidFill = _BAR_PALETTE[_idx % len(_BAR_PALETTE)]
+            bc6.series[0].dPt.append(_pt)
         bc6.visible_cells_only = False
         ws6.add_chart(bc6,"B22")
         for col in ["O","P"]: ws6.column_dimensions[col].hidden = True
@@ -1064,18 +1274,18 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws6,"G",r,f"{zhp:.0f}%",bg,bold=True)
         dc(ws6,"I",r,impact,bg,align="left",wrap=True); ws6.row_dimensions[r].height=28
 
-    widths(ws6,{"A":2,"B":8,"C":8,"D":12,"E":8,"F":6,"G":8,"H":4,"I":8,"J":8,"K":14,"L":2})
+    widths(ws6,{"A":2,"B":8,"C":8,"D":24,"E":8,"F":6,"G":8,"H":4,"I":10,"J":8,"K":18,"L":2})
 
     # ── SHEET 7: Pillar 7 — Equipment Reliability ─────────────────────────────
     ws7 = wb.create_sheet("7 · Reliability"); ws7.sheet_view.showGridLines = False
     title_row(ws7,f"PILLAR 7: EQUIPMENT RELIABILITY  ·  {asset_label}",1,"L")
-    sub_row(ws7,"MTBF (Mean Time Between Failures) and MTTR (Mean Time to Repair) by month. H1 2026.",2,"L")
+    sub_row(ws7,f"MTBF (Mean Time Between Failures) and MTTR (Mean Time to Repair) by month. {pl}.",2,"L")
     ws7.row_dimensions[3].height=10
 
     for col,lbl,val,bg in [
         ("B","MTBF (Overall)",f"{p7['mtbf_overall']} days",rag_bg("GREEN" if p7['mtbf_overall']>7 else "AMBER" if p7['mtbf_overall']>3 else "RED")),
         ("F","MTTR",f"{p7['mttr']} hrs" if p7['mttr'] else "N/A",rag_bg("AMBER") if not p7['mttr'] else LIGHT_ROW),
-        ("J","Total Breakdowns (H1)",str(sum(p7['bkd_mo'])),LIGHT_ROW),
+        ("J",f"Total Breakdowns ({pl})",str(sum(p7['bkd_mo'])),LIGHT_ROW),
     ]:
         ec = chr(ord(col)+2)
         ws7.merge_cells(f"{col}4:{ec}4"); ws7[f"{col}4"].value=lbl
@@ -1086,7 +1296,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         ws7[f"{col}5"].fill=wfill(bg); ws7[f"{col}5"].alignment=cal(); ws7[f"{col}5"].border=bdr()
     ws7.row_dimensions[4].height=16; ws7.row_dimensions[5].height=30; ws7.row_dimensions[6].height=10
 
-    sec(ws7,"MONTHLY RELIABILITY METRICS  (H1 2026)",7,"L")
+    sec(ws7,f"MONTHLY RELIABILITY METRICS  ({pl})",7,"L")
     for col,txt,ec in [("B","Month","C"),("D","BKDs","E"),("F","MTBF (30d/BKD)","G"),
                         ("H","MTTR (hrs)","I"),("J","Best/Worst","L")]:
         hdr(ws7,col,8,txt,ec)
@@ -1101,28 +1311,31 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         else: fbg = bg
         for mc in [f"B{r}:C{r}",f"D{r}:E{r}",f"F{r}:G{r}",f"H{r}:I{r}",f"J{r}:L{r}"]:
             ws7.merge_cells(mc)
-        dc(ws7,"B",r,mo+" 2026",bg,bold=True); dc(ws7,"D",r,bkd_c,bg)
+        dc(ws7,"B",r,mo,bg,bold=True); dc(ws7,"D",r,bkd_c,bg)
         dc(ws7,"F",r,f"{m30}d" if m30 else "—",bg)
         dc(ws7,"H",r,f"{mt}h" if mt else "—",bg)
         dc(ws7,"J",r,flag,fbg,align="left"); ws7.row_dimensions[r].height=18
 
-    ws7.row_dimensions[16].height=10
-    sec(ws7,f"MTTR NOTE: {p7['mttr_note']}",16,"L",ORANGE if not p7['mttr'] else HDR_BG)
+    r_note7 = 9 + n_mo + 1
+    ws7.row_dimensions[r_note7].height=10
+    sec(ws7,f"MTTR NOTE: {p7['mttr_note']}",r_note7,"L",ORANGE if not p7['mttr'] else HDR_BG)
 
     # MTBF chart (hidden cols)
     for i,(mo,m30) in enumerate(zip(p7['months_str'],[round(30/c,1) if c>0 else 0 for c in p7['bkd_mo']])):
         ws7[f"O{9+i}"].value = mo; ws7[f"P{9+i}"].value = m30
     ws7["P8"].value = "MTBF (days)"
-    ws7.row_dimensions[18].height=10
-    sec(ws7,"MONTHLY MTBF CHART",18,"L",HDR_BG)
-    lc7 = LineChart(); lc7.title="MTBF by Month (H1 2026)"; lc7.style=10; lc7.width=22; lc7.height=12
+    r_lc7 = r_note7 + 2
+    ws7.row_dimensions[r_lc7].height=10
+    sec(ws7,f"MONTHLY MTBF CHART  ({pl})",r_lc7,"L",HDR_BG)
+    lc7 = LineChart(); lc7.title=f"MTBF by Month ({pl})"; lc7.style=10
+    lc7.width = min(22 + max(0, n_mo-6)*2, 38); lc7.height=12
     lc7.y_axis.title="Days Between Failures"
-    lc7.add_data(Reference(ws7,min_col=16,min_row=8,max_row=14),titles_from_data=True)
-    lc7.set_categories(Reference(ws7,min_col=15,min_row=9,max_row=14))
+    lc7.add_data(Reference(ws7,min_col=16,min_row=8,max_row=8+n_mo),titles_from_data=True)
+    lc7.set_categories(Reference(ws7,min_col=15,min_row=9,max_row=8+n_mo))
     lc7.series[0].graphicalProperties.line.solidFill="2E75B6"; lc7.series[0].graphicalProperties.line.width=28575
     lc7.series[0].marker.symbol="circle"; lc7.series[0].marker.size=8
     lc7.visible_cells_only = False
-    ws7.add_chart(lc7,"B19")
+    ws7.add_chart(lc7,f"B{r_lc7+1}")
     for col in ["O","P"]: ws7.column_dimensions[col].hidden = True
     widths(ws7,{"A":2,"B":8,"C":8,"D":10,"E":4,"F":14,"G":4,"H":12,"I":4,"J":14,"K":8,"L":4})
 
@@ -1152,20 +1365,21 @@ if uploaded:
     with st.spinner("Running analysis across 7 pillars…"):
         try:
             df, pm, bkd, fuc, ref_date = prep_data(uploaded)
+            mw = build_month_window(df)
 
             cost_df = None
             if cost_uploaded:
                 cost_df = pd.read_excel(cost_uploaded)
 
-            p1 = pillar1_compliance(pm, bkd, fuc, df)
-            p2 = pillar2_failure_prevention(pm, bkd)
+            p1 = pillar1_compliance(pm, bkd, fuc, df, mw)
+            p2 = pillar2_failure_prevention(pm, bkd, mw)
             p3 = pillar3_coverage(pm, bkd)
             p4 = pillar4_wo_quality(pm, bkd, fuc)
-            p5 = pillar5_backlog(df, ref_date)
-            p6 = pillar6_cost(pm, bkd, fuc, df, cost_df)
-            p7 = pillar7_reliability(bkd, df, ref_date)
+            p5 = pillar5_backlog(df, ref_date, mw)
+            p6 = pillar6_cost(pm, bkd, fuc, df, cost_df, mw)
+            p7 = pillar7_reliability(bkd, df, ref_date, mw)
 
-            st.success("Analysis complete." + (" Cost data included." if cost_df is not None else " No cost file — upload cost export for Pillar 6."))
+            st.success(f"Analysis complete — {mw['period_label']}." + (" Cost data included." if cost_df is not None else " No cost file — upload cost export for Pillar 6."))
             cols = st.columns(7)
             for col_ui, pname, p_data in zip(cols, PILLARS, [p1,p2,p3,p4,p5,p6,p7]):
                 rag   = p_data['rag']
@@ -1173,7 +1387,7 @@ if uploaded:
                 col_ui.metric(pname.split(". ",1)[1], emoji)
 
             output = build_workbook(df, pm, bkd, fuc, ref_date, asset_label,
-                                    [p1,p2,p3,p4,p5,p6,p7], cost_df=cost_df)
+                                    [p1,p2,p3,p4,p5,p6,p7], cost_df=cost_df, mw=mw)
             from datetime import date
             fname = f"PM_Effectiveness_{date.today().strftime('%Y%m%d')}.xlsx"
             st.download_button(
