@@ -637,7 +637,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
     lc.series[0].graphicalProperties.line.solidFill="2E75B6"; lc.series[0].graphicalProperties.line.width=28575
     lc.series[0].marker.symbol="circle"; lc.series[0].marker.size=7
     lc.series[1].graphicalProperties.line.solidFill="ED7D31"; lc.series[1].graphicalProperties.line.width=19050
-    lc.series[1].graphicalProperties.line.dashDot="dash"
+    lc.visible_cells_only = False
     ws2.add_chart(lc,"B18")
     for col in ["O","P","Q"]: ws2.column_dimensions[col].hidden = True
 
@@ -840,6 +840,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
     bc5.set_categories(Reference(ws5,min_col=15,min_row=r_ch+2,max_row=r_ch+7))
     bc5.series[0].graphicalProperties.solidFill="2E75B6"
     bc5.series[1].graphicalProperties.solidFill="375623"
+    bc5.visible_cells_only = False
     ws5.add_chart(bc5,f"B{r_ch+2}")
     for col in ["O","P","Q"]: ws5.column_dimensions[col].hidden = True
     widths(ws5,{"A":2,"B":8,"C":8,"D":16,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":8,"L":2})
@@ -974,6 +975,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses):
     lc7.set_categories(Reference(ws7,min_col=15,min_row=9,max_row=14))
     lc7.series[0].graphicalProperties.line.solidFill="2E75B6"; lc7.series[0].graphicalProperties.line.width=28575
     lc7.series[0].marker.symbol="circle"; lc7.series[0].marker.size=8
+    lc7.visible_cells_only = False
     ws7.add_chart(lc7,"B19")
     for col in ["O","P"]: ws7.column_dimensions[col].hidden = True
     widths(ws7,{"A":2,"B":8,"C":8,"D":10,"E":4,"F":14,"G":4,"H":12,"I":4,"J":14,"K":8,"L":4})
