@@ -714,7 +714,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         f"PM compliance: {p1['teco_pct']:.0f}% TECO rate across {len(pm)} PM WOs. Schedule adherence: {p1['adh_pct']:.0f}%.",
         f"MTBF: {p7['mtbf_overall']} days overall ({pl}). Trend: {p2['trend_dir']}.",
         f"{p3['gaps']} of {len(p3['cov_df'])} failure clusters have no corresponding PM task.",
-        f"⚠  {p4['bkd_zero']}/{total_bkds} breakdown WOs carry zero actual hours — failure labor cost is largely invisible.",
+        (f"⚠  {p4['bkd_zero']}/{total_bkds} breakdown WOs carry zero actual hours — failure labor cost is largely invisible."
+         if total_bkds > 0 else
+         "✓ No breakdown WOs in this period — equipment running without recorded failures."),
         f"Backlog: {p5['total_open']} open WOs, avg age {p5['avg_age']:.0f} days, {p5['age_91p']} aged 90+ days.",
     ]
     for j, txt in enumerate(findings):
@@ -1305,10 +1307,10 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                                                [round(30/c,1) if c>0 else 0 for c in p7['bkd_mo']],
                                                p7['mttr_mo'])):
         r = i+9; bg = LIGHT_ROW if i%2==0 else WHITE
-        flag = ""
-        if bkd_c == min(c for c in p7['bkd_mo'] if c>0): flag = "Best month ↑"; fbg = GREEN_FLG
-        elif bkd_c == max(p7['bkd_mo']): flag = "Worst month ↓"; fbg = RED_FLG
-        else: fbg = bg
+        flag = ""; fbg = bg
+        _nonzero = [c for c in p7['bkd_mo'] if c > 0]
+        if _nonzero and bkd_c == min(_nonzero): flag = "Best month ↑"; fbg = GREEN_FLG
+        elif _nonzero and bkd_c == max(_nonzero): flag = "Worst month ↓"; fbg = RED_FLG
         for mc in [f"B{r}:C{r}",f"D{r}:E{r}",f"F{r}:G{r}",f"H{r}:I{r}",f"J{r}:L{r}"]:
             ws7.merge_cells(mc)
         dc(ws7,"B",r,mo,bg,bold=True); dc(ws7,"D",r,bkd_c,bg)
