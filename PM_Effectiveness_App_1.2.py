@@ -357,6 +357,37 @@ def pillar1_compliance(pm, bkd, fuc, df, mw):
     }
 
 
+_NOISE_WORDS = {
+    'PM','WO','WORK','ORDER','MAINTENANCE','THE','AND','OF','FOR','IN','ON',
+    'AT','TO','A','AN','IS','BE','BY','WITH','AS','ALL','ANY','PER','NO',
+}
+
+def _kw_overlap(desc1, desc2):
+    """Jaccard similarity (0–100) between meaningful words in two WO descriptions."""
+    def tokens(d):
+        return {w for w in re.findall(r'[A-Z]{3,}', str(d).upper()) if w not in _NOISE_WORDS}
+    w1, w2 = tokens(desc1), tokens(desc2)
+    if not w1 or not w2:
+        return 0
+    return round(100 * len(w1 & w2) / len(w1 | w2))
+
+def _pair_confidence(pm_desc, bkd_desc, days, pm_count, bkd_rate_pct):
+    """
+    Score a PM→BKD pairing on three axes and return (score, label, kw_pct).
+      Keyword overlap  0–40 : shared component/section terms in descriptions
+      Timing           0–30 : proximity — same day max, −3 pts per day
+      Statistical      0–30 : √N × rate — rewards repeating patterns
+    ≥65 → HIGH, ≥40 → MED, <40 → LOW
+    """
+    kw      = _kw_overlap(pm_desc, bkd_desc)
+    kw_pts  = min(40, round(kw * 0.40))
+    tim_pts = max(0, 30 - days * 3)
+    stat    = min(30, round((pm_count ** 0.5) * (bkd_rate_pct / 100) * 15))
+    total   = kw_pts + tim_pts + stat
+    label   = "HIGH" if total >= 65 else ("MED" if total >= 40 else "LOW")
+    return total, label, kw
+
+
 def pillar2_failure_prevention(pm, bkd, mw):
     """Failure Prevention"""
     months_str = mw['months_str']
@@ -422,35 +453,64 @@ def pillar2_failure_prevention(pm, bkd, mw):
                    else "No clear linear relationship")
 
     # Per-task: how often does a BKD occur within 7 days after this PM task?
+    # Also scores keyword overlap between the PM description and any following BKDs.
     task_corr_rows = []
     for desc, grp in pm_h1.groupby('Description'):
         grp = grp.sort_values('Basic Start Date')
         bkd_after = 0
+        kw_scores  = []
         for _, pm_row in grp.iterrows():
             win_end = pm_row['Basic Start Date'] + pd.Timedelta(days=7)
             nearby  = bkd[(bkd['Basic Start Date'] > pm_row['Basic Start Date']) &
                           (bkd['Basic Start Date'] <= win_end)]
-            if len(nearby) > 0: bkd_after += 1
+            if len(nearby) > 0:
+                bkd_after += 1
+                for _, nb in nearby.iterrows():
+                    kw_scores.append(_kw_overlap(desc, nb['Description']))
+        rate     = round(100 * bkd_after / len(grp), 0) if len(grp) else 0
+        avg_kw   = round(np.mean(kw_scores)) if kw_scores else 0
+        _, conf, _ = _pair_confidence(desc, desc, 0, len(grp), rate)   # timing neutral for task-level
+        # Recalc properly: use avg kw and stat weight only (timing not meaningful at task level)
+        kw_pts   = min(40, round(avg_kw * 0.40))
+        stat_pts = min(30, round((len(grp) ** 0.5) * (rate / 100) * 15))
+        conf_score = kw_pts + stat_pts
+        conf_label = "HIGH" if conf_score >= 55 else ("MED" if conf_score >= 30 else "LOW")
         task_corr_rows.append({
             'PM_Task': desc, 'PM_Count': len(grp),
             'BKD_Within_7d': bkd_after,
-            'BKD_Rate_Pct': round(100*bkd_after/len(grp), 0) if len(grp) else 0,
+            'BKD_Rate_Pct': rate,
+            'Avg_KW_Match': avg_kw,
+            'Conf_Score': conf_score,
+            'Conf_Label': conf_label,
         })
-    task_corr = pd.DataFrame(task_corr_rows).sort_values('BKD_Rate_Pct', ascending=False).reset_index(drop=True)
+    task_corr = (pd.DataFrame(task_corr_rows)
+                 .sort_values(['BKD_Rate_Pct','Conf_Score'], ascending=False)
+                 .reset_index(drop=True))
 
-    # PM→Breakdown pairs
+    # PM→Breakdown pairs — per-pair confidence scoring
     pm_bkd_rows = []
     for _, bd in bkd.iterrows():
         prior = pm[pm['Basic Start Date'] <= bd['Basic Start Date']]
         if not len(prior): continue
-        last = prior.iloc[-1]; days = (bd['Basic Start Date'] - last['Basic Start Date']).days
-        cat = ("Same day" if days == 0 else "1-3 days" if days <= 3
-               else "4-7 days" if days <= 7 else "8+ days")
-        pm_bkd_rows.append({'PM_WO': last['WorkOrderNumber'], 'PM_Desc': last['Description'],
+        last = prior.iloc[-1]
+        days = (bd['Basic Start Date'] - last['Basic Start Date']).days
+        cat  = ("Same day" if days == 0 else "1-3 days" if days <= 3
+                else "4-7 days" if days <= 7 else "8+ days")
+        # Find this PM task's overall rate for stat weight
+        task_rate = 0
+        tc_match = task_corr[task_corr['PM_Task'] == last['Description']]
+        if len(tc_match): task_rate = float(tc_match.iloc[0]['BKD_Rate_Pct'])
+        n_this_task = len(pm[pm['Description'] == last['Description']])
+        c_score, c_label, kw = _pair_confidence(
+            last['Description'], bd['Description'], min(days, 7), n_this_task, task_rate)
+        pm_bkd_rows.append({
+            'PM_WO':   last['WorkOrderNumber'], 'PM_Desc': last['Description'],
             'PM_Date': last['Basic Start Date'].strftime('%Y-%m-%d'),
-            'BKD_WO': bd['WorkOrderNumber'], 'BKD_Desc': bd['Description'],
+            'BKD_WO':  bd['WorkOrderNumber'],  'BKD_Desc': bd['Description'],
             'BKD_Date': bd['Basic Start Date'].strftime('%Y-%m-%d') if pd.notna(bd['Basic Start Date']) else '—',
-            'Days': days, 'Category': cat})
+            'Days': days, 'Category': cat,
+            'KW_Match': kw, 'Conf_Score': c_score, 'Conf_Label': c_label,
+        })
     pm_bkd = pd.DataFrame(pm_bkd_rows) if pm_bkd_rows else pd.DataFrame()
 
     rag = trend_clr
@@ -970,7 +1030,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         fg = rag_fg("RED") if "⚠" in txt else "1F2D3D"
         bg = RAG_RED_BG if "⚠" in txt else (RAG_RED_BG if j==0 and red_count>0 else LIGHT_ROW)
         ws0.merge_cells(f"B{r}:L{r}")
-        dc(ws0,"B",r,txt,bg,align="left",wrap=True); ws0.row_dimensions[r].height = 22
+        dc(ws0,"B",r,txt,bg,align="left",wrap=True); ws0.row_dimensions[r].height = 30
 
     # ── PRIORITY ACTIONS — dynamic, data-driven, ranked by severity score ────
     recs      = generate_recommendations(p1, p2, p3, p4, p5, p6, p7, pm, bkd, mw)
@@ -1143,6 +1203,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                 dc(ws1,"J",r,int(row['Schedule_Slip_Days']),ORANGE if row['Schedule_Slip_Days']>30 else bg,bold=True)
                 dc(ws1,"L",r,int(row.get('Schedule_Changes',0)),bg); ws1.row_dimensions[r].height=22
 
+    ws1.freeze_panes = "B4"
     widths(ws1,{"A":2,"B":18,"C":8,"D":8,"E":10,"F":8,"G":5,"H":10,"I":5,"J":10,"K":5,"L":14,"M":6})
 
     # ── SHEET 2: Pillar 2 — Failure Prevention ───────────────────────────────
@@ -1236,27 +1297,63 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     r_corr = r_pb + 8; ws2.row_dimensions[r_corr].height=10
     sec(ws2,"PM → BREAKDOWN CORRELATION ANALYSIS",r_corr+1,"L",HDR_BG)
     corr_bg = GREEN_FLG if p2['corr_coef'] < -0.3 else (RED_FLG if p2['corr_coef'] > 0.3 else ORANGE)
-    ws2.merge_cells(f"B{r_corr+2}:E{r_corr+2}"); ws2.merge_cells(f"F{r_corr+2}:L{r_corr+2}")
+    ws2.merge_cells(f"B{r_corr+2}:E{r_corr+2}"); ws2.merge_cells(f"F{r_corr+2}:O{r_corr+2}")
     dc(ws2,"B",r_corr+2,"Pearson r (monthly PM count vs BKD count)",HDR_BG,align="left",bold=True)
-    dc(ws2,"F",r_corr+2,f"{p2['corr_coef']:+.2f}  —  {p2['corr_interp']}",corr_bg,align="left")
-    ws2.row_dimensions[r_corr+2].height=22
+    dc(ws2,"F",r_corr+2,f"{p2['corr_coef']:+.2f}  —  {p2['corr_interp']}",corr_bg,align="left",wrap=True)
+    ws2.row_dimensions[r_corr+2].height=30
     if len(p2['task_corr']):
         hdr_r = r_corr+3
-        for col,txt,ec in [("B","PM Task","F"),("G","PM Count","H"),("I","BKDs w/in 7d","J"),("K","BKD Rate %","L")]:
+        sub_row(ws2,
+            "Confidence scores: Keyword = shared component/section terms in descriptions (0–40); "
+            "Statistical = √N × rate (0–30). HIGH ≥55, MED ≥30, LOW <30.",
+            hdr_r, "O", height=32)
+        hdr_r += 1
+        for col,txt,ec in [("B","PM Task","E"),("F","Execs","G"),("H","BKDs ≤7d","I"),
+                            ("J","Rate %","K"),("L","Kw Match","M"),("N","Confidence","O")]:
             hdr(ws2,col,hdr_r,txt,ec)
-        ws2.row_dimensions[hdr_r].height=18
+        ws2.row_dimensions[hdr_r].height=20
+        conf_bg_map = {"HIGH": RED_FLG, "MED": ORANGE, "LOW": GREEN_FLG}
         for i,(_,row) in enumerate(p2['task_corr'].iterrows()):
             r = hdr_r+1+i
             bg = RED_FLG if row['BKD_Rate_Pct']>=50 else (ORANGE if row['BKD_Rate_Pct']>=25 else LIGHT_ROW)
-            ws2.merge_cells(f"B{r}:F{r}"); ws2.merge_cells(f"G{r}:H{r}")
-            ws2.merge_cells(f"I{r}:J{r}"); ws2.merge_cells(f"K{r}:L{r}")
+            cbg = conf_bg_map.get(row['Conf_Label'], LIGHT_ROW)
+            for mc in [f"B{r}:E{r}",f"F{r}:G{r}",f"H{r}:I{r}",f"J{r}:K{r}",f"L{r}:M{r}",f"N{r}:O{r}"]:
+                ws2.merge_cells(mc)
             dc(ws2,"B",r,row['PM_Task'],bg,align="left",wrap=True)
-            dc(ws2,"G",r,int(row['PM_Count']),bg)
-            dc(ws2,"I",r,int(row['BKD_Within_7d']),bg)
-            dc(ws2,"K",r,f"{int(row['BKD_Rate_Pct'])}%",bg,bold=True)
+            dc(ws2,"F",r,int(row['PM_Count']),bg)
+            dc(ws2,"H",r,int(row['BKD_Within_7d']),bg)
+            dc(ws2,"J",r,f"{int(row['BKD_Rate_Pct'])}%",bg,bold=True)
+            dc(ws2,"L",r,f"{int(row['Avg_KW_Match'])}%",bg)
+            dc(ws2,"N",r,f"{row['Conf_Label']}  ({int(row['Conf_Score'])})",cbg,bold=(row['Conf_Label']=="HIGH"))
             ws2.row_dimensions[r].height=30
-    ws2.freeze_panes = "B9"
-    widths(ws2,{"A":2,"B":14,"C":4,"D":8,"E":8,"F":4,"G":14,"H":4,"I":28,"J":10,"K":4,"L":14})
+
+        # High-confidence PM→BKD pair detail
+        if len(p2['pm_bkd']) and 'Conf_Label' in p2['pm_bkd'].columns:
+            high_pairs = p2['pm_bkd'][p2['pm_bkd']['Conf_Label'].isin(['HIGH','MED'])].sort_values('Conf_Score', ascending=False).head(12)
+            if len(high_pairs):
+                r_pairs = hdr_r + len(p2['task_corr']) + 3
+                ws2.row_dimensions[r_pairs-1].height = 10
+                sec(ws2,"HIGH / MED CONFIDENCE PM→BKD PAIRS  ·  same-component signal",r_pairs-1,"O",RAG_RED if any(p2['pm_bkd']['Conf_Label']=='HIGH') else ORANGE)
+                for col,txt,ec in [("B","PM Description","E"),("F","PM Date","G"),
+                                   ("H","BKD Description","K"),("L","BKD Date","M"),
+                                   ("N","Days","N"),("O","Confidence","O")]:
+                    hdr(ws2,col,r_pairs,txt,ec)
+                ws2.row_dimensions[r_pairs].height = 20
+                for i,(_,pr) in enumerate(high_pairs.iterrows()):
+                    r = r_pairs+1+i
+                    cbg = conf_bg_map.get(pr['Conf_Label'], LIGHT_ROW)
+                    for mc in [f"B{r}:E{r}",f"F{r}:G{r}",f"H{r}:K{r}",f"L{r}:M{r}"]:
+                        ws2.merge_cells(mc)
+                    dc(ws2,"B",r,pr['PM_Desc'],cbg,align="left",wrap=True)
+                    dc(ws2,"F",r,pr['PM_Date'],cbg)
+                    dc(ws2,"H",r,pr['BKD_Desc'],cbg,align="left",wrap=True)
+                    dc(ws2,"L",r,pr['BKD_Date'],cbg)
+                    dc(ws2,"N",r,int(pr['Days']),cbg)
+                    dc(ws2,"O",r,f"{pr['Conf_Label']} ({int(pr['Conf_Score'])})",cbg,bold=(pr['Conf_Label']=='HIGH'))
+                    ws2.row_dimensions[r].height=28
+
+    ws2.freeze_panes = "B4"
+    widths(ws2,{"A":2,"B":14,"C":4,"D":8,"E":6,"F":8,"G":4,"H":14,"I":4,"J":8,"K":4,"L":8,"M":4,"N":14,"O":4})
 
     # ── SHEET 3: Pillar 3 — Failure Mode Coverage ─────────────────────────────
     ws3 = wb.create_sheet("3 · Coverage Gap"); ws3.sheet_view.showGridLines = False
@@ -1298,7 +1395,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws3,"H",r,row['Status'],bg)
         dc(ws3,"J",r,row['Priority'],RED_FLG if row['Priority']=="HIGH" else (ORANGE if row['Priority']=="MED" else GREEN_FLG),bold=True)
         dc(ws3,"L",r,action,bg,align="left",wrap=True); ws3.row_dimensions[r].height=26
-    ws3.freeze_panes = "B9"
+    # ws3 is short — no freeze needed
     widths(ws3,{"A":2,"B":8,"C":20,"D":8,"E":6,"F":8,"G":6,"H":18,"I":4,"J":8,"K":6,"L":30})
 
     # ── SHEET 4: Pillar 4 — Work Order Quality ─────────────────────────────
@@ -1368,7 +1465,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws4,"B",15,
            "Planned Hours column not found in Celonis export. Add 'Planned Hours' to the export to enable this analysis.",
            YELLOW,align="left",wrap=True); ws4.row_dimensions[15].height=28
-    ws4.freeze_panes = "B9"
+    # ws4 is short — no freeze needed
     widths(ws4,{"A":2,"B":8,"C":8,"D":22,"E":10,"F":8,"G":10,"H":4,"I":10,"J":4,"K":32,"L":2})
 
     # ── SHEET 5: Pillar 5 — Backlog Health ───────────────────────────────────
@@ -1405,7 +1502,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         ws5.merge_cells(f"B{r}:D{r}"); ws5.merge_cells(f"E{r}:F{r}"); ws5.merge_cells(f"G{r}:H{r}"); ws5.merge_cells(f"I{r}:L{r}")
         dc(ws5,"B",r,lbl,bg,bold=True); dc(ws5,"E",r,ct,bg)
         dc(ws5,"G",r,f"{100*ct/p5['total_open']:.0f}%" if p5['total_open'] else "—",bg)
-        dc(ws5,"I",r,assess,bg,align="left",wrap=True); ws5.row_dimensions[r].height=22
+        dc(ws5,"I",r,assess,bg,align="left",wrap=True); ws5.row_dimensions[r].height=28
 
     sec(ws5,"OPEN WOs BY TYPE",13,"L",HDR_BG)
     for col,txt,ec in [("B","Order Type","D"),("E","Count","F"),("G","Avg Age (d)","H"),("I","Max Age (d)","J")]:
@@ -1460,7 +1557,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             ws5.merge_cells(f"B{r}:D{r}"); ws5.merge_cells(f"E{r}:F{r}"); ws5.merge_cells(f"G{r}:L{r}")
             dc(ws5,"B",r,lbl,bg,bold=True,align="left")
             dc(ws5,"E",r,ct,bg,bold=True)
-            dc(ws5,"G",r,assess,bg,align="left",wrap=True); ws5.row_dimensions[r].height=22
+            dc(ws5,"G",r,assess,bg,align="left",wrap=True); ws5.row_dimensions[r].height=28
         # Overdue WO detail
         if len(p5.get('overdue_df', pd.DataFrame())):
             r_ov = r_due + 5; ws5.row_dimensions[r_ov-1].height = 10
@@ -1480,7 +1577,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                 dc(ws5,"K",r,str(row.iloc[3]) if len(row) > 3 else "—",bg,align="left")
                 ws5.row_dimensions[r].height=22
 
-    ws5.freeze_panes = "B8"
+    ws5.freeze_panes = "B4"
     widths(ws5,{"A":2,"B":10,"C":8,"D":20,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":10,"L":2})
 
     # ── SHEET 6: Pillar 6 — Cost Visibility ──────────────────────────────────
@@ -1643,9 +1740,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             ws6.merge_cells(mc)
         dc(ws6,"B",r,wt,bg,bold=True,align="left"); dc(ws6,"E",r,zh,bg)
         dc(ws6,"G",r,f"{zhp:.0f}%",bg,bold=True)
-        dc(ws6,"I",r,impact,bg,align="left",wrap=True); ws6.row_dimensions[r].height=28
+        dc(ws6,"I",r,impact,bg,align="left",wrap=True); ws6.row_dimensions[r].height=36
 
-    ws6.freeze_panes = "B8"
+    # ws6 is not long enough to need a freeze
     widths(ws6,{"A":2,"B":8,"C":8,"D":26,"E":8,"F":6,"G":8,"H":4,"I":12,"J":8,"K":22,"L":2})
 
     # ── SHEET 7: Pillar 7 — Equipment Reliability ─────────────────────────────
@@ -1721,7 +1818,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     lc7.visible_cells_only = False
     ws7.add_chart(lc7,f"B{r_lc7+1}")
     for col in ["O","P"]: ws7.column_dimensions[col].hidden = True
-    ws7.freeze_panes = "B9"
+    ws7.freeze_panes = "B4"
     widths(ws7,{"A":2,"B":10,"C":8,"D":10,"E":4,"F":14,"G":4,"H":14,"I":4,"J":16,"K":8,"L":4})
 
     buf = io.BytesIO()
