@@ -40,11 +40,11 @@ def title_row(ws, text, row, end_col="J"):
     c.font = Font(name="Arial", bold=True, color=WHITE, size=13)
     c.fill = wfill(DARK_BG); c.alignment = cal(); ws.row_dimensions[row].height = 26
 
-def sub_row(ws, text, row, end_col="J"):
+def sub_row(ws, text, row, end_col="J", height=20):
     ws.merge_cells(f"B{row}:{end_col}{row}")
     c = ws[f"B{row}"]; c.value = text
     c.font = Font(name="Arial", italic=True, color="AAAAAA", size=9)
-    c.fill = wfill(DARK_BG); c.alignment = cal(wrap=True); ws.row_dimensions[row].height = 16
+    c.fill = wfill(DARK_BG); c.alignment = cal(wrap=True); ws.row_dimensions[row].height = height
 
 def sec(ws, text, row, end_col="J", bg=MID_BG):
     ws.merge_cells(f"B{row}:{end_col}{row}")
@@ -302,8 +302,10 @@ def pillar1_compliance(pm, bkd, fuc, df, mw):
         late_ct  = vc.get('Late (≤50%)', 0) + vc.get('Significantly late', 0)
         total_i  = len(sched); adh_pct = 100*on_time/total_i
         by_type  = sched.groupby(['PM_Description','Expected_Days']).agg(
-            Intervals=('Actual_Gap','count'), Avg_Gap=('Actual_Gap','mean'),
-            Avg_Var=('Variance','mean'), Max_Late=('Variance','max'),
+            Intervals=('Actual_Gap','count'),
+            Avg_Gap=('Actual_Gap','mean'),
+            Avg_AbsVar=('Variance', lambda x: x.abs().mean()),  # avg absolute deviation — never misleadingly zero
+            Max_Dev=('Variance',   lambda x: x.abs().max()),    # worst single interval
             On_Time=('Status', lambda x: (x=='On time').sum())).reset_index()
         by_type['OT_Pct'] = (by_type['On_Time']/by_type['Intervals']*100).round(0).astype(int)
     else:
@@ -839,7 +841,7 @@ def generate_recommendations(p1, p2, p3, p4, p5, p6, p7, pm, bkd, mw):
                 recs.append({
                     'severity': 'MED',
                     'category': '1 · Compliance & Scheduling',
-                    'finding':  f'"{name}" — {ot}% on-time ({int(worst_ct["Intervals"])} intervals, avg variance {worst_ct["Avg_Var"]:+.0f}d)',
+                    'finding':  f'"{name}" — {ot}% on-time ({int(worst_ct["Intervals"])} intervals, avg |dev| ±{worst_ct["Avg_AbsVar"]:.0f}d)',
                     'action':   'Review scheduling window and execution capacity; check if frequency aligns with available labor hours',
                     'score':    (100 - ot) * 0.6,
                 })
@@ -1001,9 +1003,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             dc(ws0,"E",r,rec['category'],bg,align="left")
             dc(ws0,"H",r,rec['finding'],bg,align="left",wrap=True)
             dc(ws0,"K",r,rec['action'],bg,align="left",wrap=True)
-            ws0.row_dimensions[r].height = 34
+            ws0.row_dimensions[r].height = 52
 
-    widths(ws0,{"A":2,"B":4,"C":8,"D":4,"E":8,"F":8,"G":8,"H":8,"I":8,"J":8,"K":28,"L":2})
+    widths(ws0,{"A":2,"B":4,"C":9,"D":4,"E":12,"F":8,"G":6,"H":12,"I":10,"J":10,"K":28,"L":6})
 
     # ── SHEET 1: Pillar 1 — Compliance & Scheduling ──────────────────────────
     ws1 = wb.create_sheet("1 · Compliance"); ws1.sheet_view.showGridLines = False
@@ -1028,24 +1030,27 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     ws1.row_dimensions[4].height=16; ws1.row_dimensions[5].height=30; ws1.row_dimensions[6].height=10
 
     sec(ws1,f"SCHEDULE ADHERENCE BY PM TASK  ({pl})",7,"L")
-    for col,txt,ec in [("B","PM Task","D"),("E","Expected","F"),("G","Intervals","H"),
-                        ("I","Avg Gap","J"),("K","Avg Variance","L"),("M","On-Time %",None)]:
-        hdr(ws1,col,8,txt,ec)
-    ws1.row_dimensions[8].height = 18
+    sub_row(ws1,"On time = gap within ±20% of expected interval (min ±1d). Avg |Dev| = mean absolute deviation — can't be zero when OT% < 100%.",8,"L",height=26)
+    for col,txt,ec in [("B","PM Task","D"),("E","Interval / Tol","F"),("G","Count","H"),
+                        ("I","Avg Gap","J"),("K","Avg |Dev|","L"),("M","OT %",None)]:
+        hdr(ws1,col,9,txt,ec)
+    ws1.row_dimensions[9].height = 20
     if len(p1['by_type']):
-        for i, row in p1['by_type'].sort_values('OT_Pct',ascending=True).iterrows():
-            r  = 9 + list(p1['by_type'].sort_values('OT_Pct',ascending=True).index).index(i)
+        sorted_bt = p1['by_type'].sort_values('OT_Pct', ascending=True).reset_index(drop=True)
+        for i, row in sorted_bt.iterrows():
+            r  = 10 + i
             ot = row['OT_Pct']
             bg = GREEN_FLG if ot==100 else (LIGHT_ROW if ot>=90 else (ORANGE if ot>=67 else RED_FLG))
-            var_s = f"+{row['Avg_Var']:.1f}d" if row['Avg_Var']>0 else f"{row['Avg_Var']:.1f}d"
+            abs_var_s = f"±{row['Avg_AbsVar']:.1f}d (max {row['Max_Dev']:.0f}d)"
+            tol = max(1, int(row['Expected_Days']) * 0.2) if row['Expected_Days'] else 1
             for mc in [f"B{r}:D{r}",f"E{r}:F{r}",f"G{r}:H{r}",f"I{r}:J{r}",f"K{r}:L{r}"]:
                 ws1.merge_cells(mc)
-            dc(ws1,"B",r,row['PM_Description'],bg,bold=True,align="left")
-            dc(ws1,"E",r,f"{int(row['Expected_Days'])}d ({int(row['Expected_Days']//7)}WK)",bg)
+            dc(ws1,"B",r,row['PM_Description'],bg,bold=True,align="left",wrap=True)
+            dc(ws1,"E",r,f"{int(row['Expected_Days'])}d / ±{tol:.0f}d",bg)
             dc(ws1,"G",r,int(row['Intervals']),bg)
             dc(ws1,"I",r,f"{row['Avg_Gap']:.1f}d",bg)
-            dc(ws1,"K",r,var_s,bg)
-            dc(ws1,"M",r,f"{int(ot)}%",bg,bold=True); ws1.row_dimensions[r].height=18
+            dc(ws1,"K",r,abs_var_s,bg)
+            dc(ws1,"M",r,f"{int(ot)}%",bg,bold=True); ws1.row_dimensions[r].height=26
 
     row_ct = 9 + (len(p1['by_type']) if len(p1['by_type']) else 1) + 1
     ws1.row_dimensions[row_ct].height = 10
@@ -1138,7 +1143,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                 dc(ws1,"J",r,int(row['Schedule_Slip_Days']),ORANGE if row['Schedule_Slip_Days']>30 else bg,bold=True)
                 dc(ws1,"L",r,int(row.get('Schedule_Changes',0)),bg); ws1.row_dimensions[r].height=22
 
-    widths(ws1,{"A":2,"B":10,"C":10,"D":10,"E":10,"F":10,"G":4,"H":12,"I":4,"J":12,"K":4,"L":16,"M":4})
+    widths(ws1,{"A":2,"B":18,"C":8,"D":8,"E":10,"F":8,"G":5,"H":10,"I":5,"J":10,"K":5,"L":14,"M":6})
 
     # ── SHEET 2: Pillar 2 — Failure Prevention ───────────────────────────────
     ws2 = wb.create_sheet("2 · Failure Prevention"); ws2.sheet_view.showGridLines = False
@@ -1205,8 +1210,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     ws2.add_chart(lc,f"B{r_lc2+1}")
     for col in ["O","P","Q"]: ws2.column_dimensions[col].hidden = True
 
-    # PM→BKD summary — placed after chart (chart ≈ 18 rows tall)
-    r_pb = max(33, r_lc2 + 20); ws2.row_dimensions[r_pb].height=10
+    # PM→BKD summary — chart is 12cm ≈ 19 rows; add clearance
+    r_pb = max(44, r_lc2 + 22); ws2.row_dimensions[r_pb].height=10
     sec(ws2,"PM → BREAKDOWN TIMING SUMMARY",r_pb+1,"L",HDR_BG)
     cat_clr = {"Same day": GREEN_FLG,"1-3 days": RED_FLG,"4-7 days": ORANGE,"8+ days": LIGHT_ROW}
     if len(p2['pm_bkd']):
@@ -1249,8 +1254,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             dc(ws2,"G",r,int(row['PM_Count']),bg)
             dc(ws2,"I",r,int(row['BKD_Within_7d']),bg)
             dc(ws2,"K",r,f"{int(row['BKD_Rate_Pct'])}%",bg,bold=True)
-            ws2.row_dimensions[r].height=22
-    widths(ws2,{"A":2,"B":10,"C":4,"D":8,"E":8,"F":4,"G":14,"H":4,"I":28,"J":10,"K":4,"L":14})
+            ws2.row_dimensions[r].height=30
+    ws2.freeze_panes = "B9"
+    widths(ws2,{"A":2,"B":14,"C":4,"D":8,"E":8,"F":4,"G":14,"H":4,"I":28,"J":10,"K":4,"L":14})
 
     # ── SHEET 3: Pillar 3 — Failure Mode Coverage ─────────────────────────────
     ws3 = wb.create_sheet("3 · Coverage Gap"); ws3.sheet_view.showGridLines = False
@@ -1291,8 +1297,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
            GREEN_FLG if row['PM_Covered'] else RED_FLG,bold=True)
         dc(ws3,"H",r,row['Status'],bg)
         dc(ws3,"J",r,row['Priority'],RED_FLG if row['Priority']=="HIGH" else (ORANGE if row['Priority']=="MED" else GREEN_FLG),bold=True)
-        dc(ws3,"L",r,action,bg,align="left",wrap=True); ws3.row_dimensions[r].height=22
-    widths(ws3,{"A":2,"B":8,"C":18,"D":8,"E":6,"F":8,"G":6,"H":18,"I":4,"J":8,"K":6,"L":28})
+        dc(ws3,"L",r,action,bg,align="left",wrap=True); ws3.row_dimensions[r].height=26
+    ws3.freeze_panes = "B9"
+    widths(ws3,{"A":2,"B":8,"C":20,"D":8,"E":6,"F":8,"G":6,"H":18,"I":4,"J":8,"K":6,"L":30})
 
     # ── SHEET 4: Pillar 4 — Work Order Quality ─────────────────────────────
     ws4 = wb.create_sheet("4 · WO Quality"); ws4.sheet_view.showGridLines = False
@@ -1334,7 +1341,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
             ws4.merge_cells(mc)
         dc(ws4,"B",r,wt,bg,bold=True,align="left"); dc(ws4,"E",r,tot,bg)
         dc(ws4,"G",r,zh,bg); dc(ws4,"I",r,f"{zhp:.1f}%",bg,bold=True)
-        dc(ws4,"K",r,assess,bg,align="left",wrap=True); ws4.row_dimensions[r].height=28
+        dc(ws4,"K",r,assess,bg,align="left",wrap=True); ws4.row_dimensions[r].height=32
 
     if p4['has_planned']:
         ws4.row_dimensions[13].height=10
@@ -1361,7 +1368,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws4,"B",15,
            "Planned Hours column not found in Celonis export. Add 'Planned Hours' to the export to enable this analysis.",
            YELLOW,align="left",wrap=True); ws4.row_dimensions[15].height=28
-    widths(ws4,{"A":2,"B":8,"C":8,"D":20,"E":10,"F":8,"G":10,"H":4,"I":10,"J":4,"K":30,"L":2})
+    ws4.freeze_panes = "B9"
+    widths(ws4,{"A":2,"B":8,"C":8,"D":22,"E":10,"F":8,"G":10,"H":4,"I":10,"J":4,"K":32,"L":2})
 
     # ── SHEET 5: Pillar 5 — Backlog Health ───────────────────────────────────
     ws5 = wb.create_sheet("5 · Backlog Health"); ws5.sheet_view.showGridLines = False
@@ -1434,9 +1442,9 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     ws5.add_chart(bc5,f"B{r_ch+2}")
     for col in ["O","P","Q"]: ws5.column_dimensions[col].hidden = True
 
-    # ── Due Date Urgency section (new format only) ────────────────────────────
+    # ── Due Date Urgency section (new format only) — placed below chart ───────
     if p5.get('overdue_ct', 0) > 0 or p5.get('due_0_7', 0) > 0 or p5.get('due_8_30', 0) > 0:
-        r_due = r_ch + 22; ws5.row_dimensions[r_due-1].height = 10
+        r_due = r_ch + 25; ws5.row_dimensions[r_due-1].height = 10
         urg_hdr_bg = RAG_RED if p5['overdue_ct'] > 0 else MID_BG
         sec(ws5,f"DUE DATE URGENCY  ·  {p5['overdue_ct']} WOs overdue",r_due-1,"L",urg_hdr_bg)
         for col,txt,ec in [("B","Status","D"),("E","Count","F"),("G","Assessment","L")]:
@@ -1467,12 +1475,13 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                 ws5.merge_cells(f"B{r}:C{r}"); ws5.merge_cells(f"D{r}:H{r}")
                 ws5.merge_cells(f"I{r}:J{r}"); ws5.merge_cells(f"K{r}:L{r}")
                 dc(ws5,"B",r,str(row.iloc[0]),bg)
-                dc(ws5,"D",r,str(row.iloc[1]),bg,align="left")
+                dc(ws5,"D",r,str(row.iloc[1]),bg,align="left",wrap=True)
                 dc(ws5,"I",r,f"{abs(int(row.iloc[2]))}d",bg,bold=True)
                 dc(ws5,"K",r,str(row.iloc[3]) if len(row) > 3 else "—",bg,align="left")
-                ws5.row_dimensions[r].height=18
+                ws5.row_dimensions[r].height=22
 
-    widths(ws5,{"A":2,"B":10,"C":8,"D":16,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":8,"L":2})
+    ws5.freeze_panes = "B8"
+    widths(ws5,{"A":2,"B":10,"C":8,"D":20,"E":8,"F":6,"G":12,"H":4,"I":12,"J":4,"K":10,"L":2})
 
     # ── SHEET 6: Pillar 6 — Cost Visibility ──────────────────────────────────
     ws6 = wb.create_sheet("6 · Cost Visibility"); ws6.sheet_view.showGridLines = False
@@ -1615,7 +1624,7 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
                 f"Labor cost of failures cannot be assessed. MTTR cannot be calculated. "
                 f"Upload cost export to see dollar impact. Require technicians to book time on all GM02 WOs.")
     dc(ws6,"B",next_r+2,flag_msg,RED_FLG,align="left",wrap=True,bold=True)
-    ws6.row_dimensions[next_r+2].height=40
+    ws6.row_dimensions[next_r+2].height=60
 
     for col,txt,ec in [("B","WO Type","D"),("E","Zero-Hr WOs","F"),("G","Zero-Hr %","H"),("I","Impact","L")]:
         hdr(ws6,col,next_r+3,txt,ec)
@@ -1636,7 +1645,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         dc(ws6,"G",r,f"{zhp:.0f}%",bg,bold=True)
         dc(ws6,"I",r,impact,bg,align="left",wrap=True); ws6.row_dimensions[r].height=28
 
-    widths(ws6,{"A":2,"B":8,"C":8,"D":24,"E":8,"F":6,"G":8,"H":4,"I":10,"J":8,"K":18,"L":2})
+    ws6.freeze_panes = "B8"
+    widths(ws6,{"A":2,"B":8,"C":8,"D":26,"E":8,"F":6,"G":8,"H":4,"I":12,"J":8,"K":22,"L":2})
 
     # ── SHEET 7: Pillar 7 — Equipment Reliability ─────────────────────────────
     ws7 = wb.create_sheet("7 · Reliability"); ws7.sheet_view.showGridLines = False
@@ -1697,7 +1707,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     for i,(mo,m30) in enumerate(zip(p7['months_str'],[round(30/c,1) if c>0 else 0 for c in p7['bkd_mo']])):
         ws7[f"O{9+i}"].value = mo; ws7[f"P{9+i}"].value = m30
     ws7["P8"].value = "MTBF (days)"
-    r_lc7 = r_note7 + 2
+    # If elapsed MTTR note was written at r_note7+2, bump chart section down to avoid collision
+    r_lc7 = (r_note7 + 4) if p7.get('mttr_elapsed') is not None else (r_note7 + 2)
     ws7.row_dimensions[r_lc7].height=10
     sec(ws7,f"MONTHLY MTBF CHART  ({pl})",r_lc7,"L",HDR_BG)
     lc7 = LineChart(); lc7.title=f"MTBF by Month ({pl})"; lc7.style=10
@@ -1710,7 +1721,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
     lc7.visible_cells_only = False
     ws7.add_chart(lc7,f"B{r_lc7+1}")
     for col in ["O","P"]: ws7.column_dimensions[col].hidden = True
-    widths(ws7,{"A":2,"B":8,"C":8,"D":10,"E":4,"F":14,"G":4,"H":12,"I":4,"J":14,"K":8,"L":4})
+    ws7.freeze_panes = "B9"
+    widths(ws7,{"A":2,"B":10,"C":8,"D":10,"E":4,"F":14,"G":4,"H":14,"I":4,"J":16,"K":8,"L":4})
 
     buf = io.BytesIO()
     wb.save(buf); buf.seek(0)
