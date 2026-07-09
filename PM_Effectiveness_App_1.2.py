@@ -1588,8 +1588,8 @@ def build_workbook(df, pm, bkd, fuc, ref_date, asset_label, analyses, cost_df=No
         ws6.add_chart(bc6,"B22")
         for col in ["O","P"]: ws6.column_dimensions[col].hidden = True
 
-        # ── Top cost WOs
-        r_top = 36; ws6.row_dimensions[r_top].height=10
+        # ── Top cost WOs — placed after chart (11cm ≈ 17 rows from row 22)
+        r_top = max(44, 22 + n_mo + 10); ws6.row_dimensions[r_top].height=10
         sec(ws6,f"TOP {min(10,len(p6['top_wos']))} WOs BY COST",r_top+1,"L",HDR_BG)
         for col,txt,ec in [("B","WO Number","C"),("D","Description","H"),
                             ("I","Cost","J"),("K","vs. Plan","L")]:
